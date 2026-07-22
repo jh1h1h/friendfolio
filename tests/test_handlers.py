@@ -9,7 +9,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parents[1] / "functions"))
 
 from friendfolio.handlers import BotHandlers  # noqa: E402
-from friendfolio.models import NoteProposal  # noqa: E402
+from friendfolio.models import NoteProposal, SearchPlan  # noqa: E402
 
 from .test_models_and_helpers import proposal_payload  # noqa: E402
 
@@ -40,6 +40,15 @@ class FakeRegistry:
     def __init__(self) -> None:
         self.staged: list[dict[str, Any]] = []
         self.pending: dict[str, dict[str, Any]] = {}
+        self.search_calls: list[dict[str, Any]] = []
+        self.search_results: list[dict[str, Any]] = [
+            {
+                "id": "note1234",
+                "target_name": "Alice",
+                "category": "status",
+                "content": "Alice started a new role.",
+            }
+        ]
 
     def list_entity_names(self, user_id: int, target_type: str) -> list[str]:
         del user_id, target_type
@@ -93,6 +102,18 @@ class FakeRegistry:
         item["status"] = "cancelled"
         return "cancelled"
 
+    def search_notes(
+        self,
+        owner_user_id: int,
+        query: str,
+        limit: int = 20,
+        plan: SearchPlan | None = None,
+    ) -> list[dict[str, Any]]:
+        self.search_calls.append(
+            {"owner_user_id": owner_user_id, "query": query, "limit": limit, "plan": plan}
+        )
+        return self.search_results[:limit]
+
 
 class FakeClassifier:
     def classify(self, *args: Any, **kwargs: Any) -> NoteProposal:
@@ -104,6 +125,22 @@ class FakeClassifier:
         payload = current_proposal.model_dump(mode="json")
         payload["summary"] = f"Revised: {instruction}"
         return NoteProposal.model_validate(payload)
+
+    def search(self, query: str, *args: Any, **kwargs: Any) -> SearchPlan:
+        del args, kwargs
+        return SearchPlan.model_validate(
+            {
+                "summary": f"Search for {query}",
+                "include_terms": ["alice", "role"],
+                "exclude_terms": [],
+                "entity_names": ["Alice"],
+                "target_types": ["friend"],
+                "categories": ["status"],
+                "limit": 20,
+                "sort_by": "relevance",
+                "require_all_terms": False,
+            }
+        )
 
 
 class HandlerTests(unittest.TestCase):
@@ -163,6 +200,23 @@ class HandlerTests(unittest.TestCase):
         self.assertIn("Revised:", telegram.edits[0]["text"])
         self.assertEqual(registry.staged[0]["last_instruction"], "make it about her new manager role")
         self.assertIn("Approve", telegram.edits[0]["reply_markup"]["inline_keyboard"][0][0]["text"])
+
+    def test_search_uses_deepseek_plan(self) -> None:
+        handlers, telegram, registry = self.build()
+        handlers.handle_update(
+            {
+                "update_id": 102,
+                "message": {
+                    "text": "/search find Alice's role",
+                    "from": {"id": 123},
+                    "chat": {"id": 123, "type": "private"},
+                },
+            }
+        )
+        self.assertEqual(len(registry.search_calls), 1)
+        self.assertIsNotNone(registry.search_calls[0]["plan"])
+        self.assertIn("Results for", telegram.sent[-1]["text"])
+        self.assertIn("Alice", telegram.sent[-1]["text"])
 
     def test_unauthorized_user_can_only_get_whoami(self) -> None:
         handlers, telegram, registry = self.build()

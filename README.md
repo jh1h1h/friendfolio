@@ -24,6 +24,7 @@ Firebase Hosting is not needed; it hosts websites, whereas Telegram calls the fu
 - Project notes and completable next actions.
 - DeepSeek-assisted `/add` proposals with explicit **Approve**/**Cancel** buttons.
 - Atomic, idempotent Firestore approval: retrying a webhook cannot duplicate approved notes.
+- DeepSeek-assisted semantic `/search` over notes and entities.
 - Uncategorized inbox with AI reclassification.
 - Daily birthday, overdue follow-up and uncategorized-inbox notifications.
 - Telegram user allowlist and private-chat restriction.
@@ -173,7 +174,7 @@ firebase deploy --only functions
 | `/inbox` | Show uncategorized notes |
 | `/reclassify <ID> [context]` | Retry an inbox note |
 | `/birthdays` | Show birthdays |
-| `/search <words>` | Case-insensitive substring search |
+| `/search <words>` | DeepSeek-assisted semantic search over notes |
 | `/whoami` | Show your Telegram user ID |
 
 ## Firestore structure

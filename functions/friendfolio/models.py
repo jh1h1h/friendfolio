@@ -72,3 +72,22 @@ class NoteProposal(BaseModel):
 
     summary: str = Field(min_length=1, max_length=300)
     items: list[ProposalItem] = Field(min_length=1, max_length=8)
+
+
+class SearchPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1, max_length=300)
+    include_terms: list[str] = Field(default_factory=list, max_length=12)
+    exclude_terms: list[str] = Field(default_factory=list, max_length=8)
+    entity_names: list[str] = Field(default_factory=list, max_length=8)
+    target_types: list[TargetType] = Field(default_factory=list, max_length=3)
+    categories: list[Category] = Field(default_factory=list, max_length=6)
+    limit: int = Field(default=20, ge=1, le=20)
+    sort_by: Literal["relevance", "newest"] = "relevance"
+    require_all_terms: bool = False
+
+    @field_validator("include_terms", "exclude_terms", "entity_names")
+    @classmethod
+    def strip_terms(cls, values: list[str]) -> list[str]:
+        return [value.strip() for value in values if value and value.strip()]

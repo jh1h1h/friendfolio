@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence
@@ -8,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from firebase_admin import firestore
 
-from .models import NoteProposal
+from .models import NoteProposal, SearchPlan
 
 
 UTC = timezone.utc
@@ -432,17 +433,82 @@ class FirestoreRegistry:
         ref.update({"follow_up_at": until.astimezone(UTC)})
         return True
 
+    @staticmethod
+    def _normalize_search_text(value: str) -> str:
+        return " ".join(value.casefold().split())
+
+    @staticmethod
+    def _tokenize_search_text(value: str) -> list[str]:
+        return re.findall(r"[\w']+", value.casefold())
+
     def search_notes(
-        self, owner_user_id: int, query: str, limit: int = 20
+        self,
+        owner_user_id: int,
+        query: str,
+        limit: int = 20,
+        plan: SearchPlan | None = None,
     ) -> list[dict[str, Any]]:
-        needle = query.casefold()
-        rows = [
-            note
-            for note in self.all_notes(owner_user_id)
-            if needle in str(note.get("content", "")).casefold()
-        ]
-        rows.sort(key=lambda note: _sort_time(note.get("created_at")), reverse=True)
-        return rows[:limit]
+        search_plan = plan or SearchPlan(
+            summary="Fallback search plan",
+            include_terms=self._tokenize_search_text(query),
+            limit=limit,
+        )
+        include_terms = [self._normalize_search_text(term) for term in search_plan.include_terms]
+        exclude_terms = [self._normalize_search_text(term) for term in search_plan.exclude_terms]
+        entity_names = [self._normalize_search_text(name) for name in search_plan.entity_names]
+        target_types = set(search_plan.target_types)
+        categories = set(search_plan.categories)
+        query_text = self._normalize_search_text(query)
+
+        rows: list[tuple[int, datetime, dict[str, Any]]] = []
+        for note in self.all_notes(owner_user_id):
+            note_text = self._normalize_search_text(
+                " ".join(
+                    str(part)
+                    for part in [
+                        note.get("content", ""),
+                        note.get("raw_input", ""),
+                        note.get("target_name", ""),
+                        note.get("category", ""),
+                        note.get("target_type", ""),
+                    ]
+                )
+            )
+            if target_types and note.get("target_type") not in target_types:
+                continue
+            if categories and note.get("category") not in categories:
+                continue
+            if exclude_terms and any(term in note_text for term in exclude_terms):
+                continue
+
+            score = 0
+            if include_terms:
+                matched_terms = [term for term in include_terms if term and term in note_text]
+                if search_plan.require_all_terms and len(matched_terms) != len(include_terms):
+                    continue
+                score += len(matched_terms) * 4
+            else:
+                matched_terms = []
+
+            if query_text and query_text in note_text:
+                score += 5
+            if entity_names and self._normalize_search_text(str(note.get("target_name", ""))) in entity_names:
+                score += 6
+            elif entity_names and any(entity in note_text for entity in entity_names):
+                score += 3
+
+            if note.get("target_type") == "uncategorized":
+                score += 1
+
+            if score <= 0 and include_terms:
+                continue
+            rows.append((score, _sort_time(note.get("created_at")), note))
+
+        if search_plan.sort_by == "newest":
+            rows.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        else:
+            rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [note for _, _, note in rows[: search_plan.limit or limit]]
 
     @staticmethod
     def _birthday_for_year(mm_dd: str, year: int) -> date:

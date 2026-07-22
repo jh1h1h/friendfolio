@@ -34,7 +34,7 @@ Bot commands may include the bot username, such as `/help@FriendfolioBot`. The u
 | `/next` | `_next()` | Filters pending notes to project notes categorized as `next_action`, returning up to 30. |
 | `/done <ID>` | `_done()` | Resolves a unique note-ID prefix and changes its follow-up status from `pending` to `done`, recording `completed_at`. |
 | `/birthdays` | `_birthdays()` | Reads friends with `birthday_mm_dd`, sorts them by month/day and name, and displays the saved dates. |
-| `/search <words>` | `_search()` | Performs a case-insensitive substring scan of active note content, sorts newest first, and returns up to 20 matches. |
+| `/search <words>` | `_search()` | Uses DeepSeek to turn the query into a structured search plan, then ranks matching notes locally and returns up to 20 results. |
 
 Unknown commands receive `Unknown command. Use /help.` Commands with missing or invalid arguments receive a usage message and do not write anything.
 
@@ -104,6 +104,8 @@ users/{telegram-user-id}
 - Friend and project IDs are hashes of normalized names, so capitalization and repeated spaces do not create separate entities.
 - Telegram displays the first eight characters of note IDs. Commands accepting an ID require that prefix to match exactly one active note.
 - Archived notes are omitted from normal lists and searches.
+- Search uses DeepSeek to produce a structured plan and then ranks notes locally; if DeepSeek
+  fails, the bot falls back to a token-based local search plan.
 - Firestore client rules deny direct access; the deployed Firebase Admin SDK performs these operations.
 
 ## Relevant source files

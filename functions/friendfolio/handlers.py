@@ -8,7 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .deepseek import DeepSeekClassifier
-from .models import NoteProposal, ProposalItem
+from .models import NoteProposal, ProposalItem, SearchPlan
 from .store import FirestoreRegistry, safe_id, utc_now
 from .telegram_api import TelegramAPI
 
@@ -568,7 +568,29 @@ class BotHandlers:
         if not query:
             self.telegram.send(chat_id, "Usage: /search words")
             return
-        rows = self.registry.search_notes(user_id, query)
+        plan: SearchPlan | None = None
+        try:
+            plan = self.classifier.search(
+                query,
+                self.registry.list_entity_names(user_id, "friend"),
+                self.registry.list_entity_names(user_id, "project"),
+                _now_in_timezone(self.timezone_name),
+            )
+            LOGGER.warning(
+                "search_plan query_len=%s summary=%s include_terms=%s entity_names=%s target_types=%s categories=%s limit=%s sort_by=%s require_all_terms=%s",
+                len(query),
+                plan.summary,
+                plan.include_terms,
+                plan.entity_names,
+                plan.target_types,
+                plan.categories,
+                plan.limit,
+                plan.sort_by,
+                plan.require_all_terms,
+            )
+        except Exception:
+            LOGGER.exception("DeepSeek search planning failed; falling back to local search plan")
+        rows = self.registry.search_notes(user_id, query, plan=plan)
         if not rows:
             self.telegram.send(chat_id, "No matching notes.")
             return

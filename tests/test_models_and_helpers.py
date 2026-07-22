@@ -89,6 +89,49 @@ class ModelAndHelperTests(unittest.TestCase):
         self.assertEqual(captured["response_format"], {"type": "json_object"})
         self.assertEqual(captured["thinking"], {"type": "disabled"})
 
+    def test_deepseek_search_request_uses_json_mode(self) -> None:
+        captured: dict[str, object] = {}
+
+        def responder(request: httpx.Request) -> httpx.Response:
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "summary": "Search for Alice's role",
+                                        "include_terms": ["alice", "role"],
+                                        "exclude_terms": [],
+                                        "entity_names": ["Alice"],
+                                        "target_types": ["friend"],
+                                        "categories": ["status"],
+                                        "limit": 20,
+                                        "sort_by": "relevance",
+                                        "require_all_terms": False,
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+
+        classifier = DeepSeekClassifier(
+            "test-key", "deepseek-v4-flash", "Asia/Singapore"
+        )
+        classifier.client = httpx.Client(transport=httpx.MockTransport(responder))
+        plan = classifier.search(
+            "find Alice's role", ["Alice"], [], __import__("datetime").datetime.now()
+        )
+
+        self.assertEqual(plan.include_terms, ["alice", "role"])
+        self.assertEqual(captured["model"], "deepseek-v4-flash")
+        self.assertEqual(captured["response_format"], {"type": "json_object"})
+        self.assertEqual(captured["thinking"], {"type": "disabled"})
+
     def test_february_29_maps_to_february_28_in_non_leap_year(self) -> None:
         self.assertEqual(
             FirestoreRegistry._birthday_for_year("02-29", 2027), date(2027, 2, 28)
