@@ -1,0 +1,4 @@
+firebase-admin>=6.9,<8
+firebase-functions>=0.4,<1
+httpx>=0.28,<1
+pydantic>=2.11,<3

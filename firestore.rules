@@ -1,0 +1,11 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // This project has no client application. Cloud Functions use the Admin SDK,
+    // which bypasses these client rules. Deny every direct client read/write.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
