@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import html
 import logging
+from datetime import UTC
 from datetime import datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .deepseek import DeepSeekClassifier
 from .models import NoteProposal, ProposalItem
@@ -45,6 +46,14 @@ def _local_datetime(value: Any, timezone_name: str) -> str:
     if not isinstance(value, datetime):
         return "no date"
     return value.astimezone(ZoneInfo(timezone_name)).strftime("%d %b %Y, %H:%M")
+
+
+def _now_in_timezone(timezone_name: str) -> datetime:
+    try:
+        return datetime.now(ZoneInfo(timezone_name))
+    except ZoneInfoNotFoundError:
+        LOGGER.warning("Timezone %s not found; defaulting to UTC", timezone_name)
+        return datetime.now(UTC)
 
 
 def _proposal_preview(proposal: NoteProposal, timezone_name: str) -> str:
@@ -133,6 +142,16 @@ class BotHandlers:
         command = command_word.split("@", 1)[0].casefold()
         body = body.strip()
 
+        LOGGER.warning(
+            "message_received user_id=%s chat_id=%s chat_type=%s command=%s text_len=%s update_id=%s",
+            user_id,
+            chat_id,
+            chat.get("type"),
+            command,
+            len(text),
+            update_id,
+        )
+
         if command == "/whoami":
             self.telegram.send(
                 chat_id,
@@ -165,7 +184,13 @@ class BotHandlers:
         }
         handler = commands.get(command)
         if handler:
+            LOGGER.warning("routing_command command=%s user_id=%s chat_id=%s", command, user_id, chat_id)
             handler()
+            return
+        if text and not text.startswith("/") and self._revise_pending_proposal(
+            chat_id, user_id, text
+        ):
+            return
         else:
             self.telegram.send(chat_id, "Unknown command. Use /help.")
 
@@ -188,7 +213,7 @@ class BotHandlers:
             note,
             self.registry.list_entity_names(user_id, "friend"),
             self.registry.list_entity_names(user_id, "project"),
-            datetime.now(ZoneInfo(self.timezone_name)),
+            _now_in_timezone(self.timezone_name),
         )
 
     def _add(self, chat_id: int, user_id: int, note: str, update_id: int) -> None:
@@ -236,12 +261,137 @@ class BotHandlers:
             )
             return
         prefix = "DeepSeek categorization failed. " if fallback else ""
-        self.telegram.send(
+        sent = self.telegram.send(
             chat_id,
             prefix + _proposal_preview(proposal, self.timezone_name),
             parse_mode="HTML",
             reply_markup=_approval_keyboard(token),
         )
+        result = sent.get("result") if isinstance(sent, dict) else None
+        if isinstance(result, dict):
+            message_id = result.get("message_id")
+            if isinstance(message_id, int):
+                self.registry.set_pending_message(user_id, token, chat_id, message_id)
+
+    def _revise_pending_proposal(
+        self, chat_id: int, user_id: int, instruction: str
+    ) -> bool:
+        LOGGER.warning(
+            "revise_pending_start user_id=%s chat_id=%s instruction_len=%s",
+            user_id,
+            chat_id,
+            len(instruction),
+        )
+        pending = self.registry.latest_pending_action(user_id)
+        if not pending:
+            LOGGER.warning("revise_pending_no_pending user_id=%s chat_id=%s", user_id, chat_id)
+            return False
+        if not instruction.strip():
+            LOGGER.warning("revise_pending_empty_instruction user_id=%s chat_id=%s", user_id, chat_id)
+            return False
+        expires_at = pending.get("expires_at")
+        if isinstance(expires_at, datetime) and expires_at <= utc_now():
+            LOGGER.warning(
+                "revise_pending_expired user_id=%s chat_id=%s token=%s",
+                user_id,
+                chat_id,
+                pending.get("id"),
+            )
+            self.telegram.send(
+                chat_id,
+                "The latest proposal expired. Send /add again to start over.",
+            )
+            return True
+        try:
+            current_proposal = NoteProposal.model_validate(pending["proposal"])
+        except Exception:
+            LOGGER.exception("Stored pending proposal is invalid")
+            self.telegram.send(
+                chat_id, "That proposal can no longer be edited. Please cancel it."
+            )
+            return True
+        LOGGER.warning(
+            "revise_pending_loaded token=%s item_count=%s message_id=%s",
+            pending.get("id"),
+            len(current_proposal.items),
+            pending.get("message_id"),
+        )
+        try:
+            revised = self.classifier.revise(
+                instruction,
+                current_proposal,
+                self.registry.list_entity_names(user_id, "friend"),
+                self.registry.list_entity_names(user_id, "project"),
+                _now_in_timezone(self.timezone_name),
+            )
+        except Exception:
+            LOGGER.exception("DeepSeek revision failed")
+            self.telegram.send(
+                chat_id,
+                "I could not revise that proposal. Please try again or press Cancel.",
+            )
+            return True
+        LOGGER.warning(
+            "revise_pending_classified token=%s revised_items=%s summary=%s",
+            pending.get("id"),
+            len(revised.items),
+            revised.summary,
+        )
+
+        token = str(pending.get("id", ""))
+        if not token:
+            LOGGER.warning("revise_pending_missing_token user_id=%s chat_id=%s", user_id, chat_id)
+            return False
+        status = self.registry.revise_pending(user_id, token, revised, instruction)
+        LOGGER.warning(
+            "revise_pending_firestore_result token=%s status=%s",
+            token,
+            status,
+        )
+        if status != "pending":
+            self.telegram.send(
+                chat_id, f"This proposal is {status}; it was not changed."
+            )
+            return True
+
+        preview = _proposal_preview(revised, self.timezone_name)
+        message_id = pending.get("message_id")
+        if isinstance(message_id, int):
+            LOGGER.warning(
+                "revise_pending_editing_existing_message token=%s message_id=%s",
+                token,
+                message_id,
+            )
+            self.telegram.edit(
+                chat_id,
+                message_id,
+                preview,
+                parse_mode="HTML",
+                reply_markup=_approval_keyboard(token),
+            )
+        else:
+            LOGGER.warning(
+                "revise_pending_sending_new_message token=%s has_message_id=%s",
+                token,
+                message_id,
+            )
+            sent = self.telegram.send(
+                chat_id,
+                preview,
+                parse_mode="HTML",
+                reply_markup=_approval_keyboard(token),
+            )
+            result = sent.get("result") if isinstance(sent, dict) else None
+            if isinstance(result, dict):
+                message_id = result.get("message_id")
+                if isinstance(message_id, int):
+                    LOGGER.warning(
+                        "revise_pending_saved_new_message_id token=%s message_id=%s",
+                        token,
+                        message_id,
+                    )
+                    self.registry.set_pending_message(user_id, token, chat_id, message_id)
+        return True
 
     def _list_entities(self, chat_id: int, user_id: int, target_type: str) -> None:
         rows = self.registry.list_entities(user_id, target_type)
@@ -341,12 +491,17 @@ class BotHandlers:
                 chat_id, f"This update was already processed ({status})."
             )
             return
-        self.telegram.send(
+        sent = self.telegram.send(
             chat_id,
             _proposal_preview(proposal, self.timezone_name),
             parse_mode="HTML",
             reply_markup=_approval_keyboard(token),
         )
+        result = sent.get("result") if isinstance(sent, dict) else None
+        if isinstance(result, dict):
+            message_id = result.get("message_id")
+            if isinstance(message_id, int):
+                self.registry.set_pending_message(user_id, token, chat_id, message_id)
 
     def _followups(self, chat_id: int, user_id: int) -> None:
         rows = self.registry.pending_followups(user_id)

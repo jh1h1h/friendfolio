@@ -187,6 +187,64 @@ class FirestoreRegistry:
         self.ensure_user(owner_user_id)
         return token, status
 
+    def latest_pending_action(self, owner_user_id: int) -> dict[str, Any] | None:
+        rows: list[dict[str, Any]] = []
+        for snapshot in self.collection(owner_user_id, "pending_actions").stream():
+            data = snapshot.to_dict() or {}
+            if str(data.get("status", "missing")) != "pending":
+                continue
+            data["id"] = snapshot.id
+            rows.append(data)
+        rows.sort(key=lambda item: _sort_time(item.get("created_at")), reverse=True)
+        return rows[0] if rows else None
+
+    def set_pending_message(
+        self, owner_user_id: int, token: str, chat_id: int, message_id: int
+    ) -> bool:
+        ref = self.collection(owner_user_id, "pending_actions").document(token)
+        snapshot = ref.get()
+        if not snapshot.exists:
+            return False
+        data = snapshot.to_dict() or {}
+        if str(data.get("status", "missing")) != "pending":
+            return False
+        ref.update({"chat_id": chat_id, "message_id": message_id})
+        return True
+
+    def revise_pending(
+        self,
+        owner_user_id: int,
+        token: str,
+        proposal: NoteProposal,
+        instruction: str,
+    ) -> str:
+        ref = self.collection(owner_user_id, "pending_actions").document(token)
+        transaction = self.client.transaction()
+
+        @firestore.transactional
+        def revise(txn: Any) -> str:
+            snapshot = ref.get(transaction=txn)
+            if not snapshot.exists:
+                return "missing"
+            data = snapshot.to_dict() or {}
+            status = str(data.get("status", "missing"))
+            if status != "pending":
+                return status
+            if data.get("expires_at") and data["expires_at"] <= utc_now():
+                txn.update(ref, {"status": "expired", "decided_at": utc_now()})
+                return "expired"
+            txn.update(
+                ref,
+                {
+                    "proposal": proposal.model_dump(mode="json"),
+                    "last_instruction": instruction,
+                    "revised_at": utc_now(),
+                },
+            )
+            return "pending"
+
+        return revise(transaction)
+
     def cancel_pending(self, owner_user_id: int, token: str) -> str:
         ref = self.collection(owner_user_id, "pending_actions").document(token)
         transaction = self.client.transaction()

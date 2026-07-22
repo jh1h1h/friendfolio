@@ -25,13 +25,13 @@ class TelegramAPI:
         *,
         parse_mode: str | None = None,
         reply_markup: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text[:4096]}
         if parse_mode:
             payload["parse_mode"] = parse_mode
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        self.call("sendMessage", **payload)
+        return self.call("sendMessage", **payload)
 
     def edit(
         self,
@@ -40,7 +40,8 @@ class TelegramAPI:
         text: str,
         *,
         parse_mode: str | None = None,
-    ) -> None:
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -48,7 +49,9 @@ class TelegramAPI:
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
-        self.call("editMessageText", **payload)
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return self.call("editMessageText", **payload)
 
     def answer_callback(self, callback_query_id: str, text: str | None = None) -> None:
         payload: dict[str, Any] = {"callback_query_id": callback_query_id}
