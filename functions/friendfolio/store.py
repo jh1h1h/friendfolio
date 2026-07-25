@@ -13,6 +13,7 @@ from .models import NoteProposal, SearchPlan
 
 
 UTC = timezone.utc
+DEFAULT_CONFIDENCE_THRESHOLD = 0.65
 
 
 def utc_now() -> datetime:
@@ -67,6 +68,29 @@ class FirestoreRegistry:
         self.user_ref(owner_user_id).set(
             {
                 "telegram_user_id": owner_user_id,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+
+    def get_confidence_threshold(self, owner_user_id: int) -> float:
+        snapshot = self.user_ref(owner_user_id).get()
+        if not snapshot.exists:
+            return DEFAULT_CONFIDENCE_THRESHOLD
+        value = (snapshot.to_dict() or {}).get(
+            "confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD
+        )
+        if isinstance(value, (int, float)) and 0 <= float(value) <= 1:
+            return float(value)
+        return DEFAULT_CONFIDENCE_THRESHOLD
+
+    def set_confidence_threshold(self, owner_user_id: int, value: float) -> None:
+        if not 0 <= value <= 1:
+            raise ValueError("Confidence threshold must be between 0 and 1")
+        self.user_ref(owner_user_id).set(
+            {
+                "telegram_user_id": owner_user_id,
+                "confidence_threshold": value,
                 "updated_at": firestore.SERVER_TIMESTAMP,
             },
             merge=True,
@@ -149,7 +173,12 @@ class FirestoreRegistry:
             if note.get("target_type") == target_type
             and note.get("target_id") == target_id
         ]
-        notes.sort(key=lambda note: _sort_time(note.get("created_at")), reverse=True)
+        notes.sort(
+            key=lambda note: _sort_time(
+                note.get("updated_at") or note.get("created_at")
+            ),
+            reverse=True,
+        )
         return entity, notes[:limit]
 
     def stage_pending(
@@ -160,6 +189,7 @@ class FirestoreRegistry:
         expiry_hours: int,
         token: str | None = None,
         source_note_id: str | None = None,
+        debug_mode: bool = False,
     ) -> tuple[str, str]:
         token = token or uuid.uuid4().hex
         ref = self.collection(owner_user_id, "pending_actions").document(token)
@@ -177,6 +207,7 @@ class FirestoreRegistry:
                     "raw_input": raw_input,
                     "proposal": proposal.model_dump(mode="json"),
                     "source_note_id": source_note_id,
+                    "debug_mode": debug_mode,
                     "status": "pending",
                     "created_at": now,
                     "expires_at": now + timedelta(hours=expiry_hours),
@@ -267,12 +298,14 @@ class FirestoreRegistry:
 
         return cancel(transaction)
 
-    def approve_pending(self, owner_user_id: int, token: str) -> tuple[str, list[str]]:
+    def approve_pending(
+        self, owner_user_id: int, token: str
+    ) -> tuple[str, list[dict[str, str]]]:
         pending_ref = self.collection(owner_user_id, "pending_actions").document(token)
         transaction = self.client.transaction()
 
         @firestore.transactional
-        def approve(txn: Any) -> tuple[str, list[str]]:
+        def approve(txn: Any) -> tuple[str, list[dict[str, str]]]:
             snapshot = pending_ref.get(transaction=txn)
             if not snapshot.exists:
                 return "missing", []
@@ -285,11 +318,63 @@ class FirestoreRegistry:
                 return "expired", []
 
             proposal = NoteProposal.model_validate(data["proposal"])
-            note_ids: list[str] = []
-            for index, item in enumerate(proposal.items):
+            # A friend/project has one consolidated ordinary note, while scheduled
+            # follow-ups remain separate. For duplicate items in the same category,
+            # the classifier's last item is the update.
+            items_by_entity: dict[tuple[str, str, str], Any] = {}
+            items_to_save: list[Any] = []
+            for item in proposal.items:
+                if item.target_type in {"friend", "project"}:
+                    key = (
+                        item.target_type,
+                        entity_id(item.target_name),
+                        item.category,
+                    )
+                    if key not in items_by_entity:
+                        items_to_save.append(key)
+                    items_by_entity[key] = item
+                else:
+                    items_to_save.append(item)
+
+            resolved_items = [
+                items_by_entity[value] if isinstance(value, tuple) else value
+                for value in items_to_save
+            ]
+
+            # Firestore transactions require every read to happen before the first
+            # write. Resolve existing notes up front so approval can update one in
+            # place and archive any duplicates left by older versions.
+            existing_notes: dict[tuple[str, str, str], list[Any]] = {}
+            notes_collection = self.collection(owner_user_id, "notes")
+            for item in resolved_items:
+                if item.target_type not in {"friend", "project"}:
+                    continue
+                target_id = entity_id(item.target_name)
+                key = (item.target_type, target_id, item.category)
+                if item.category == "follow_up":
+                    existing_notes[key] = []
+                    continue
+                query = notes_collection.where(
+                    "target_type", "==", item.target_type
+                ).where("target_id", "==", target_id)
+                existing_notes[key] = [
+                    note
+                    for note in query.stream(transaction=txn)
+                    if (note.to_dict() or {}).get("archived_at") is None
+                    and (note.to_dict() or {}).get("category")
+                    not in {"follow_up", "next_action"}
+                    and (note.to_dict() or {}).get("record_type") != "history"
+                ]
+
+            saved_notes: list[dict[str, str]] = []
+            for index, item in enumerate(resolved_items):
                 target_id: str | None = None
+                active_notes: list[Any] = []
                 if item.target_type in {"friend", "project"}:
                     target_id = entity_id(item.target_name)
+                    active_notes = existing_notes[
+                        (item.target_type, target_id, item.category)
+                    ]
                     entity_collection = self._entity_collection(item.target_type)
                     entity_ref = self.collection(
                         owner_user_id, entity_collection
@@ -297,38 +382,119 @@ class FirestoreRegistry:
                     entity_data: dict[str, Any] = {
                         "name": item.target_name,
                         "normalized_name": normalize_name(item.target_name),
-                        "note_count": firestore.Increment(1),
                         "updated_at": firestore.SERVER_TIMESTAMP,
                     }
+                    if item.target_type == "project":
+                        entity_data["note_count"] = firestore.Increment(
+                            1 if not active_notes else -(len(active_notes) - 1)
+                        )
                     if item.birthday_mm_dd:
                         entity_data["birthday_mm_dd"] = item.birthday_mm_dd
                     txn.set(entity_ref, entity_data, merge=True)
 
-                note_id = safe_id(token, index)
-                note_ref = self.collection(owner_user_id, "notes").document(note_id)
+                if active_notes:
+                    active_notes.sort(
+                        key=lambda note: _sort_time(
+                            (note.to_dict() or {}).get("created_at")
+                        ),
+                        reverse=True,
+                    )
+                    note_ref = active_notes[0].reference
+                    note_id = note_ref.id
+                    for duplicate in active_notes[1:]:
+                        txn.update(
+                            duplicate.reference,
+                            {"archived_at": firestore.SERVER_TIMESTAMP},
+                        )
+                else:
+                    note_id = safe_id(token, index)
+                    note_ref = notes_collection.document(note_id)
+
                 follow_up_at = as_utc(item.follow_up_at, self.local_timezone)
-                txn.set(
-                    note_ref,
+                note_data = {
+                    "target_type": item.target_type,
+                    "target_id": target_id,
+                    "target_name": item.target_name or "Inbox",
+                    "category": item.category,
+                    "record_type": (
+                        "follow_up"
+                        if item.category == "follow_up"
+                        else "note"
+                    ),
+                    "content": item.content,
+                    "raw_input": data["raw_input"],
+                    "occurred_on": item.occurred_on.isoformat()
+                    if item.occurred_on
+                    else None,
+                    "follow_up_at": follow_up_at,
+                    "follow_up_status": "pending"
+                    if item.category == "follow_up"
+                    else None,
+                    "confidence": item.confidence,
+                    "archived_at": None,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }
+                if not active_notes:
+                    note_data["created_at"] = firestore.SERVER_TIMESTAMP
+                txn.set(note_ref, note_data, merge=bool(active_notes))
+                saved_notes.append(
                     {
-                        "target_type": item.target_type,
-                        "target_id": target_id,
+                        "id": note_id,
+                        "action": "updated" if active_notes else "saved",
                         "target_name": item.target_name or "Inbox",
-                        "category": item.category,
+                        "target_type": item.target_type,
+                        "record_type": note_data["record_type"],
                         "content": item.content,
+                    }
+                )
+
+            history_targets = {
+                (item.target_type, entity_id(item.target_name), item.target_name)
+                for item in resolved_items
+                if item.target_type in {"friend", "project"}
+            }
+            for target_type, target_id, target_name in history_targets:
+                history_id = safe_id(token, "history", target_type, target_id)
+                history_ref = notes_collection.document(history_id)
+                txn.set(
+                    history_ref,
+                    {
+                        "target_type": target_type,
+                        "target_id": target_id,
+                        "target_name": target_name,
+                        "category": "note",
+                        "record_type": "history",
+                        "content": data["raw_input"],
                         "raw_input": data["raw_input"],
-                        "occurred_on": item.occurred_on.isoformat()
-                        if item.occurred_on
-                        else None,
-                        "follow_up_at": follow_up_at,
-                        "follow_up_status": "pending"
-                        if follow_up_at or item.category == "next_action"
-                        else None,
-                        "confidence": item.confidence,
+                        "occurred_on": None,
+                        "follow_up_at": None,
+                        "follow_up_status": None,
                         "archived_at": None,
                         "created_at": firestore.SERVER_TIMESTAMP,
+                        "updated_at": firestore.SERVER_TIMESTAMP,
                     },
                 )
-                note_ids.append(note_id)
+                entity_ref = self.collection(
+                    owner_user_id, self._entity_collection(target_type)
+                ).document(target_id)
+                txn.set(
+                    entity_ref,
+                    {
+                        "history_note_count": firestore.Increment(1),
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                saved_notes.append(
+                    {
+                        "id": history_id,
+                        "action": "saved",
+                        "target_name": target_name,
+                        "target_type": target_type,
+                        "record_type": "history",
+                        "content": str(data["raw_input"]),
+                    }
+                )
 
             source_note_id = data.get("source_note_id")
             if source_note_id:
@@ -340,7 +506,7 @@ class FirestoreRegistry:
                 pending_ref,
                 {"status": "approved", "decided_at": firestore.SERVER_TIMESTAMP},
             )
-            return "approved", note_ids
+            return "approved", saved_notes
 
         return approve(transaction)
 
@@ -404,7 +570,7 @@ class FirestoreRegistry:
             note
             for note in self.pending_followups(owner_user_id, limit=1000)
             if note.get("target_type") == "project"
-            and note.get("category") == "next_action"
+            and note.get("category") in {"follow_up", "next_action"}
         ][:limit]
 
     def complete_followup(self, owner_user_id: int, note_id: str) -> bool:
@@ -476,8 +642,15 @@ class FirestoreRegistry:
             )
             if target_types and note.get("target_type") not in target_types:
                 continue
-            if categories and note.get("category") not in categories:
-                continue
+            if categories:
+                note_category = str(note.get("category", ""))
+                category_matches = note_category in categories or (
+                    "note" in categories
+                    and note_category
+                    in {"general", "status", "like", "dislike", "birthday"}
+                )
+                if not category_matches:
+                    continue
             if exclude_terms and any(term in note_text for term in exclude_terms):
                 continue
 

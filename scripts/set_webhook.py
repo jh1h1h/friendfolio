@@ -8,15 +8,23 @@ import httpx
 
 
 COMMANDS = [
+    {"command": "start", "description": "Show Friendfolio commands"},
+    {"command": "help", "description": "Show Friendfolio commands"},
+    {"command": "whoami", "description": "Show your Telegram user ID"},
     {"command": "add", "description": "Classify and propose a note"},
+    {"command": "friend", "description": "Create or find a friend"},
+    {"command": "project", "description": "Create or find a project"},
     {"command": "friends", "description": "List friends"},
     {"command": "projects", "description": "List projects"},
-    {"command": "next", "description": "Show project next actions"},
+    {"command": "show", "description": "Show a friend or project"},
+    {"command": "next", "description": "Show pending project follow-ups"},
     {"command": "followups", "description": "Show pending follow-ups"},
+    {"command": "done", "description": "Complete a follow-up"},
     {"command": "inbox", "description": "Show uncategorized notes"},
+    {"command": "reclassify", "description": "Retry an inbox note"},
     {"command": "birthdays", "description": "Show saved birthdays"},
     {"command": "search", "description": "Search notes"},
-    {"command": "help", "description": "Show all commands"},
+    {"command": "confidence", "description": "View or set confidence threshold"},
 ]
 
 

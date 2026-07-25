@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 from datetime import UTC
 from datetime import datetime, timedelta
@@ -18,17 +19,18 @@ LOGGER = logging.getLogger(__name__)
 HELP_TEXT = """
 <b>Friendfolio commands</b>
 
-<code>/add note</code> — classify a note and ask before saving
+<code>/add [-debug] note</code> — classify a note and ask before saving
 <code>/friend name</code> / <code>/project name</code> — create an entity
 <code>/friends</code> / <code>/projects</code> — list the registry
 <code>/show friend Alice</code> — show a friend or project
-<code>/next</code> — open project next actions
+<code>/next</code> — pending project follow-ups
 <code>/followups</code> — pending follow-ups
 <code>/done ID</code> — complete an item
 <code>/inbox</code> — uncategorized notes
-<code>/reclassify ID context</code> — retry an inbox note
+<code>/reclassify [-debug] ID context</code> — retry an inbox note
 <code>/birthdays</code> — saved birthdays
 <code>/search words</code> — search note text
+<code>/confidence [0-100]</code> — view or set the confidence threshold
 <code>/whoami</code> — show your Telegram user ID
 """.strip()
 
@@ -40,6 +42,24 @@ def _short(value: str, limit: int = 220) -> str:
 
 def _display_id(note_id: str) -> str:
     return note_id[:8]
+
+
+def _context_value(value: Any) -> Any:
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def _debug_argument(value: str) -> tuple[bool, str]:
+    first, separator, remainder = value.partition(" ")
+    return (True, remainder.strip()) if first.casefold() == "-debug" else (False, value)
+
+
+def _is_context_note(note: dict[str, Any], target_type: str) -> bool:
+    record_type = note.get("record_type")
+    is_legacy_note = record_type is None and note.get("category") not in {
+        "follow_up",
+        "next_action",
+    }
+    return record_type in {"note", "summary"} or is_legacy_note
 
 
 def _local_datetime(value: Any, timezone_name: str) -> str:
@@ -181,6 +201,7 @@ class BotHandlers:
             "/done": lambda: self._done(chat_id, user_id, body),
             "/birthdays": lambda: self._birthdays(chat_id, user_id),
             "/search": lambda: self._search(chat_id, user_id, body),
+            "/confidence": lambda: self._confidence(chat_id, user_id, body),
         }
         handler = commands.get(command)
         if handler:
@@ -208,17 +229,118 @@ class BotHandlers:
         verb = "Created" if created else "Already exists"
         self.telegram.send(chat_id, f"{verb}: {target_type} {name} · {target_id[:8]}")
 
-    def _classify(self, user_id: int, note: str) -> NoteProposal:
+    def _classify(
+        self,
+        user_id: int,
+        note: str,
+        trace: list[dict[str, Any]] | None = None,
+    ) -> NoteProposal:
+        friend_names = self.registry.list_entity_names(user_id, "friend")
+        project_names = self.registry.list_entity_names(user_id, "project")
+        now = _now_in_timezone(self.timezone_name)
+        selection = self.classifier.select_context(
+            note,
+            friend_names,
+            project_names,
+            now,
+            trace=trace.append if trace is not None else None,
+        )
+        valid_friends = {name.casefold(): name for name in friend_names}
+        valid_projects = {name.casefold(): name for name in project_names}
+        selected_targets = [
+            ("friend", valid_friends[name.casefold()])
+            for name in selection.friend_names
+            if name.casefold() in valid_friends
+        ] + [
+            ("project", valid_projects[name.casefold()])
+            for name in selection.project_names
+            if name.casefold() in valid_projects
+        ]
+        prior_context = []
+        for target_type, target_name in selected_targets:
+            entity, notes = self.registry.get_entity_notes(
+                user_id, target_type, target_name
+            )
+            if entity is None:
+                continue
+            prior_context.append(
+                {
+                    "target_type": target_type,
+                    "target_name": target_name,
+                    "birthday_mm_dd": entity.get("birthday_mm_dd"),
+                    "notes": [
+                        {
+                            key: _context_value(saved_note.get(key))
+                            for key in (
+                                "category",
+                                "content",
+                                "occurred_on",
+                                "follow_up_at",
+                                "follow_up_status",
+                            )
+                        }
+                        for saved_note in notes
+                        if _is_context_note(saved_note, target_type)
+                    ],
+                }
+            )
         return self.classifier.classify(
             note,
-            self.registry.list_entity_names(user_id, "friend"),
-            self.registry.list_entity_names(user_id, "project"),
-            _now_in_timezone(self.timezone_name),
+            friend_names,
+            project_names,
+            now,
+            prior_context,
+            self.registry.get_confidence_threshold(user_id),
+            trace=trace.append if trace is not None else None,
         )
 
+    def _send_debug_trace(
+        self,
+        chat_id: int,
+        trace: list[dict[str, Any]],
+        error: Exception | None = None,
+    ) -> None:
+        if error is not None:
+            trace.append(
+                {
+                    "stage": "handler",
+                    "event": "error",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            )
+        if not trace:
+            trace.append({"stage": "handler", "event": "debug", "message": "No trace captured."})
+        for index, event in enumerate(trace, 1):
+            rendered = f"DEBUG {index}/{len(trace)}\n" + json.dumps(
+                event, ensure_ascii=False, indent=2, default=str
+            )
+            for offset in range(0, len(rendered), 3900):
+                self.telegram.send(chat_id, rendered[offset : offset + 3900])
+
+    def _confidence(self, chat_id: int, user_id: int, value: str) -> None:
+        if not value:
+            threshold = self.registry.get_confidence_threshold(user_id)
+            self.telegram.send(
+                chat_id,
+                f"Confidence threshold: {threshold:.0%}\n"
+                "Set it with /confidence 0-100.",
+            )
+            return
+        try:
+            percentage = float(value)
+        except ValueError:
+            self.telegram.send(chat_id, "Usage: /confidence 0-100")
+            return
+        if not 0 <= percentage <= 100:
+            self.telegram.send(chat_id, "Confidence must be between 0 and 100.")
+            return
+        self.registry.set_confidence_threshold(user_id, percentage / 100)
+        self.telegram.send(chat_id, f"Confidence threshold set to {percentage:g}%.")
+
     def _add(self, chat_id: int, user_id: int, note: str, update_id: int) -> None:
+        debug, note = _debug_argument(note)
         if not note:
-            self.telegram.send(chat_id, "Usage: /add your note here")
+            self.telegram.send(chat_id, "Usage: /add [-debug] your note here")
             return
         if len(note) > 5000:
             self.telegram.send(
@@ -226,10 +348,14 @@ class BotHandlers:
             )
             return
         fallback = False
+        trace: list[dict[str, Any]] | None = [] if debug else None
         try:
-            proposal = self._classify(user_id, note)
-        except Exception:
+            proposal = self._classify(user_id, note, trace)
+        except Exception as exc:
             LOGGER.exception("DeepSeek classification failed")
+            if debug:
+                self._send_debug_trace(chat_id, trace or [], exc)
+                return
             fallback = True
             proposal = NoteProposal(
                 summary="DeepSeek was unavailable; save this to the inbox?",
@@ -237,7 +363,7 @@ class BotHandlers:
                     ProposalItem(
                         target_type="uncategorized",
                         target_name="",
-                        category="general",
+                        category="note",
                         content=note,
                         occurred_on=None,
                         follow_up_at=None,
@@ -247,6 +373,8 @@ class BotHandlers:
                     )
                 ],
             )
+        if debug:
+            self._send_debug_trace(chat_id, trace or [])
         token = safe_id(user_id, update_id, "proposal")
         token, status = self.registry.stage_pending(
             user_id,
@@ -254,6 +382,7 @@ class BotHandlers:
             proposal,
             self.pending_expiry_hours,
             token=token,
+            debug_mode=debug,
         )
         if status not in {"pending"}:
             self.telegram.send(
@@ -286,6 +415,7 @@ class BotHandlers:
         if not pending:
             LOGGER.warning("revise_pending_no_pending user_id=%s chat_id=%s", user_id, chat_id)
             return False
+        debug = bool(pending.get("debug_mode", False))
         if not instruction.strip():
             LOGGER.warning("revise_pending_empty_instruction user_id=%s chat_id=%s", user_id, chat_id)
             return False
@@ -316,6 +446,7 @@ class BotHandlers:
             len(current_proposal.items),
             pending.get("message_id"),
         )
+        trace: list[dict[str, Any]] | None = [] if debug else None
         try:
             revised = self.classifier.revise(
                 instruction,
@@ -323,9 +454,12 @@ class BotHandlers:
                 self.registry.list_entity_names(user_id, "friend"),
                 self.registry.list_entity_names(user_id, "project"),
                 _now_in_timezone(self.timezone_name),
+                trace=trace.append if trace is not None else None,
             )
-        except Exception:
+        except Exception as exc:
             LOGGER.exception("DeepSeek revision failed")
+            if debug:
+                self._send_debug_trace(chat_id, trace or [], exc)
             self.telegram.send(
                 chat_id,
                 "I could not revise that proposal. Please try again or press Cancel.",
@@ -391,6 +525,8 @@ class BotHandlers:
                         message_id,
                     )
                     self.registry.set_pending_message(user_id, token, chat_id, message_id)
+        if debug:
+            self._send_debug_trace(chat_id, trace or [])
         return True
 
     def _list_entities(self, chat_id: int, user_id: int, target_type: str) -> None:
@@ -406,7 +542,9 @@ class BotHandlers:
                 else ""
             )
             lines.append(
-                f"• {html.escape(str(row['name']))} · {int(row.get('note_count', 0))} note(s){birthday}"
+                f"• {html.escape(str(row['name']))} · "
+                f"{int(row.get('history_note_count', row.get('note_count', 0)))} "
+                f"note(s){birthday}"
             )
         self.telegram.send(chat_id, "\n".join(lines), parse_mode="HTML")
 
@@ -425,6 +563,40 @@ class BotHandlers:
         lines = [f"<b>{html.escape(str(entity['name']))}</b> · {target_type}"]
         if entity.get("birthday_mm_dd"):
             lines.append(f"Birthday: {entity['birthday_mm_dd']}")
+        if target_type in {"friend", "project"}:
+            current_notes = [
+                note
+                for note in notes
+                if note.get("record_type") in {"note", "summary"}
+                or (
+                    note.get("record_type") is None
+                    and note.get("category") not in {"follow_up", "next_action"}
+                )
+            ]
+            history = [
+                note for note in notes if note.get("record_type") == "history"
+            ]
+            followups = [
+                note
+                for note in notes
+                if note.get("record_type") == "follow_up"
+                or note.get("category") in {"follow_up", "next_action"}
+            ]
+            if current_notes:
+                lines.append(
+                    "\n<b>Current note</b>\n"
+                    + html.escape(str(current_notes[0].get("content", ""))[:2500])
+                )
+            if history:
+                lines.append("\n<b>Note history</b>")
+                for note in history:
+                    lines.append(
+                        f"\n{_local_datetime(note.get('created_at'), self.timezone_name)}\n"
+                        f"{html.escape(_short(str(note.get('content', '')), 500))}"
+                    )
+            notes = followups
+            if notes:
+                lines.append("\n<b>Follow-ups</b>")
         for note in notes:
             status = (
                 f" · {note['follow_up_status']}" if note.get("follow_up_status") else ""
@@ -434,7 +606,9 @@ class BotHandlers:
                 f"<code>{html.escape(str(note.get('category', 'general')))}</code>{status}\n"
                 f"{html.escape(_short(str(note.get('content', '')), 500))}"
             )
-        if not notes:
+        if not current_notes and not history and not followups:
+            lines.append("No notes yet.")
+        elif target_type == "friend" and not summaries and not history and not notes:
             lines.append("No notes yet.")
         self.telegram.send(chat_id, "\n".join(lines), parse_mode="HTML")
 
@@ -455,9 +629,12 @@ class BotHandlers:
     def _reclassify(
         self, chat_id: int, user_id: int, body: str, update_id: int
     ) -> None:
+        debug, body = _debug_argument(body)
         parts = body.split(maxsplit=1)
         if not parts:
-            self.telegram.send(chat_id, "Usage: /reclassify ID optional context")
+            self.telegram.send(
+                chat_id, "Usage: /reclassify [-debug] ID optional context"
+            )
             return
         note_id = self.registry.resolve_note_id(user_id, parts[0])
         if not note_id:
@@ -471,12 +648,18 @@ class BotHandlers:
         text = str(source["content"]) + (
             f"\nClarifying context: {extra}" if extra else ""
         )
+        trace: list[dict[str, Any]] | None = [] if debug else None
         try:
-            proposal = self._classify(user_id, text)
-        except Exception:
+            proposal = self._classify(user_id, text, trace)
+        except Exception as exc:
             LOGGER.exception("Inbox reclassification failed")
+            if debug:
+                self._send_debug_trace(chat_id, trace or [], exc)
+                return
             self.telegram.send(chat_id, "DeepSeek failed; the inbox note is unchanged.")
             return
+        if debug:
+            self._send_debug_trace(chat_id, trace or [])
         token = safe_id(user_id, update_id, "reclassify")
         token, status = self.registry.stage_pending(
             user_id,
@@ -485,6 +668,7 @@ class BotHandlers:
             self.pending_expiry_hours,
             token=token,
             source_note_id=note_id,
+            debug_mode=debug,
         )
         if status != "pending":
             self.telegram.send(
@@ -522,9 +706,9 @@ class BotHandlers:
     def _next(self, chat_id: int, user_id: int) -> None:
         rows = self.registry.project_next_actions(user_id)
         if not rows:
-            self.telegram.send(chat_id, "No open project next actions.")
+            self.telegram.send(chat_id, "No pending project follow-ups.")
             return
-        lines = ["<b>Project next actions</b>"]
+        lines = ["<b>Project follow-ups</b>"]
         for row in rows:
             lines.append(
                 f"\n<b>#{_display_id(row['id'])}</b> · "
@@ -594,6 +778,40 @@ class BotHandlers:
         if not rows:
             self.telegram.send(chat_id, "No matching notes.")
             return
+        search_context = [
+            {
+                key: _context_value(row.get(key))
+                for key in (
+                    "id",
+                    "target_type",
+                    "target_name",
+                    "category",
+                    "content",
+                    "occurred_on",
+                    "follow_up_at",
+                    "follow_up_status",
+                    "created_at",
+                    "updated_at",
+                )
+            }
+            for row in rows
+        ]
+        try:
+            answer = self.classifier.answer_search(
+                query,
+                search_context,
+                _now_in_timezone(self.timezone_name),
+            )
+            self.telegram.send(
+                chat_id,
+                f"<b>Answer</b>\n{html.escape(answer.answer)}",
+                parse_mode="HTML",
+            )
+            return
+        except Exception:
+            LOGGER.exception(
+                "DeepSeek search answer failed; falling back to raw search results"
+            )
         lines = [f"<b>Results for {html.escape(query)}</b>"]
         for row in rows:
             lines.append(
@@ -621,11 +839,30 @@ class BotHandlers:
         kind, action, value = parts
         if kind == "proposal":
             if action == "approve":
-                status, note_ids = self.registry.approve_pending(user_id, value)
+                status, saved_notes = self.registry.approve_pending(user_id, value)
                 if status == "approved":
-                    ids = ", ".join(f"#{_display_id(note_id)}" for note_id in note_ids)
+                    lines = []
+                    for saved_note in saved_notes:
+                        verb = saved_note["action"].title()
+                        target_name = html.escape(saved_note["target_name"])
+                        if saved_note.get("record_type") == "history":
+                            label = f"{target_name}’s history note"
+                        elif saved_note["target_type"] == "uncategorized":
+                            label = "inbox note"
+                        else:
+                            label = f"{target_name}’s note"
+                        lines.append(
+                            f"<b>{verb} {label}</b>\n"
+                            f"{html.escape(saved_note['content'])}"
+                        )
+                    result_text = "\n\n".join(lines)
+                    if len(result_text) > 4000:
+                        result_text = result_text[:3999] + "…"
                     self.telegram.edit(
-                        chat_id, message_id, f"Saved {len(note_ids)} note(s): {ids}"
+                        chat_id,
+                        message_id,
+                        result_text,
+                        parse_mode="HTML",
                     )
                     return
             else:

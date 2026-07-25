@@ -20,9 +20,12 @@ Firebase Hosting is not needed; it hosts websites, whereas Telegram calls the fu
 
 ## Features
 
-- Friend facts, status, likes/dislikes, birthdays and follow-ups.
-- Project notes and completable next actions.
-- DeepSeek-assisted `/add` proposals with explicit **Approve**/**Cancel** buttons.
+- Each friend and project has an append-only timestamped history and one mutable current note.
+- Friend notes use a structured profile template; project notes remain concise and free-form.
+- Durable time references: relative dates and ages are anchored to explicit calendar dates.
+- Project notes and scheduled project follow-ups.
+- Two-stage DeepSeek `/add`: resolve related entities, load their saved context, then propose a
+  consolidated update with explicit **Approve**/**Cancel** buttons.
 - Atomic, idempotent Firestore approval: retrying a webhook cannot duplicate approved notes.
 - DeepSeek-assisted semantic `/search` over notes and entities.
 - Uncategorized inbox with AI reclassification.
@@ -140,8 +143,8 @@ The helper keeps tokens out of command-line arguments, but they are temporarily 
 current shell environment:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv functions/venv
+source functions/venv/bin/activate
 pip install httpx
 
 export TELEGRAM_BOT_TOKEN='your-token'
@@ -162,20 +165,24 @@ firebase deploy --only functions
 
 | Command | Purpose |
 | --- | --- |
-| `/add <note>` | Ask DeepSeek to classify a note, then show Approve/Cancel |
+| `/add [-debug] <note>` | Classify a note, optionally enabling traces for it and later revisions |
 | `/friend <name>` | Explicitly create a friend |
 | `/project <name>` | Explicitly create a project |
 | `/friends`, `/projects` | List entities and note counts |
 | `/show friend <name>` | Show one friend's recent notes |
 | `/show project <name>` | Show one project's recent notes |
-| `/next` | Show open project next actions |
-| `/followups` | Show pending follow-ups and next actions |
+| `/next` | Show pending project follow-ups |
+| `/followups` | Show all pending follow-ups |
 | `/done <ID>` | Complete an item using its displayed eight-character ID |
 | `/inbox` | Show uncategorized notes |
-| `/reclassify <ID> [context]` | Retry an inbox note |
+| `/reclassify [-debug] <ID> [context]` | Retry an inbox note, optionally enabling proposal traces |
 | `/birthdays` | Show birthdays |
-| `/search <words>` | DeepSeek-assisted semantic search over notes |
+| `/search <words>` | Search notes, then have DeepSeek synthesize a grounded answer |
+| `/confidence [0-100]` | View or set the per-user classification confidence threshold |
 | `/whoami` | Show your Telegram user ID |
+
+After `/add`, plain text revises the pending proposal. If the proposal began with `/add -debug`,
+all later steering automatically emits raw revision traces while continuing to update the proposal.
 
 ## Firestore structure
 
@@ -185,12 +192,16 @@ All personal data is isolated beneath the Telegram user ID:
 users/{telegram-user-id}
   friends/{stable-name-hash}
   projects/{stable-name-hash}
-  notes/{deterministic-note-id}
+  notes/{deterministic-note-id}  # current notes, history entries, follow-ups
   pending_actions/{proposal-token}
   notification_log/{notification-id}
 ```
 
 Approving a proposal writes its entities, notes and approval status in one Firestore transaction.
+For a friend or project, approval appends the original `/add` input as a timestamped history record
+and updates that entity's current note. Friend notes use the structured profile template, while
+project notes stay free-form. Scheduled follow-ups and uncategorized inbox entries remain separate.
+The approval confirmation says whether each note was saved or updated and displays its new content.
 The proposal itself is staged before approval so the buttons remain usable across cold starts, but
 no friend/project/note registry record is created until approval.
 
@@ -199,8 +210,8 @@ no friend/project/note registry record is created until approval.
 Install dependencies into a virtual environment:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv functions/venv
+source functions/venv/bin/activate
 pip install -r functions/requirements.txt
 python -m unittest discover -v
 python -m compileall -q functions scripts tests

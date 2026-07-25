@@ -23,47 +23,101 @@ Bot commands may include the bot username, such as `/help@FriendfolioBot`. The u
 | `/whoami` | Inline response | Returns the sender's numeric Telegram user ID. This deliberately runs before the allowlist check so a new user can discover their ID. |
 | `/friend <name>` | `_create_entity(..., "friend", ...)` | Validates a 1–120 character name, creates or updates `friends/{stable-name-hash}`, and reports whether it was newly created. |
 | `/project <name>` | `_create_entity(..., "project", ...)` | Same flow as `/friend`, but writes to `projects/{stable-name-hash}`. |
-| `/add <note>` | `_add()` | Validates a maximum of 5,000 characters, asks DeepSeek to classify the note, stages the proposal in `pending_actions`, and displays **Approve** and **Cancel** buttons. It does not create registry notes until approval. |
+| `/add [-debug] <note>` | `_add()` | Classifies and stages a proposal. With `-debug`, also shows raw DeepSeek traces and automatically traces later steering revisions. |
 | `/friends` | `_list_entities(..., "friend")` | Reads up to 100 friends, sorted by name, and shows note counts and saved birthdays. |
 | `/projects` | `_list_entities(..., "project")` | Reads up to 100 projects, sorted by name, and shows note counts. |
 | `/show friend <name>` | `_show()` | Resolves the stable friend ID and displays the 25 most recent active notes plus the birthday, if present. |
 | `/show project <name>` | `_show()` | Resolves the stable project ID and displays its 25 most recent active notes. |
 | `/inbox` | `_inbox()` | Shows up to 20 active notes whose `target_type` is `uncategorized`, oldest first, with eight-character display IDs. |
-| `/reclassify <ID> [context]` | `_reclassify()` | Resolves a unique note-ID prefix, confirms that it is an active inbox note, asks DeepSeek to classify it again, then stages another approval proposal. Approval archives the old inbox note and creates the replacement note or notes atomically. |
+| `/reclassify [-debug] <ID> [context]` | `_reclassify()` | Retries an inbox note, optionally enabling traces for classification and later steering. |
 | `/followups` | `_followups()` | Lists up to 30 notes with `follow_up_status: pending`, ordered by follow-up time. Items without a date appear after dated items. |
-| `/next` | `_next()` | Filters pending notes to project notes categorized as `next_action`, returning up to 30. |
+| `/next` | `_next()` | Filters pending follow-ups to project targets, returning up to 30. |
 | `/done <ID>` | `_done()` | Resolves a unique note-ID prefix and changes its follow-up status from `pending` to `done`, recording `completed_at`. |
 | `/birthdays` | `_birthdays()` | Reads friends with `birthday_mm_dd`, sorts them by month/day and name, and displays the saved dates. |
-| `/search <words>` | `_search()` | Uses DeepSeek to turn the query into a structured search plan, then ranks matching notes locally and returns up to 20 results. |
+| `/search <words>` | `_search()` | Uses DeepSeek to plan the search, ranks matching notes locally, then asks DeepSeek to synthesize a grounded answer from those matches. Falls back to raw results if answer generation fails. |
+| `/confidence [0-100]` | `_confidence()` | Shows the current per-user threshold, or stores a new percentage. Proposals below it are sent to the uncategorized inbox. |
 
 Unknown commands receive `Unknown command. Use /help.` Commands with missing or invalid arguments receive a usage message and do not write anything.
+
+Debug mode belongs to the pending proposal: `-debug` must be the first `/add` or `/reclassify`
+argument. It emits raw prompts, HTTP responses, and captured errors without including the API
+authorization header. The proposal is still staged normally. Every later steering message
+automatically emits revision traces and updates the staged proposal and Telegram preview.
 
 ## `/add` classification and approval
 
 `/add` is the only normal command that sends text to DeepSeek.
 
 1. The handler loads existing friend and project names from Firestore.
-2. `DeepSeekClassifier.classify()` sends the note, entity names, local date/time, and expected JSON schema to DeepSeek.
-3. The returned JSON is validated as a `NoteProposal`. One input can become multiple proposed notes when it refers to several friends or projects.
-4. A deterministic proposal token is calculated from the Telegram user ID and update ID. This prevents a retried Telegram update from creating duplicate proposals.
-5. The proposal is stored in `pending_actions/{token}` with `status: pending` and an expiry time, normally 24 hours.
-6. The bot shows the proposed target, category, content, dates, confidence, and reason. The registry is unchanged until **Approve** is pressed.
+2. DeepSeek selects which existing entities the new note clearly concerns. This first pass receives
+   names only and does not classify or rewrite the note.
+3. The handler validates those names against Firestore and loads each selected friend or project's
+   current note.
+4. `DeepSeekClassifier.classify()` receives the new input and selected current-note context, then
+   proposes the resulting updated note. History remains stored locally and is not sent as context.
+   Useful prior facts are preserved unless corrected or superseded by the new note.
+5. The returned JSON is validated as a `NoteProposal`. One input can affect several entities.
+6. A deterministic proposal token is calculated from the Telegram user ID and update ID. This prevents a retried Telegram update from creating duplicate proposals.
+7. The proposal is stored in `pending_actions/{token}` with `status: pending` and an expiry time, normally 24 hours.
+8. The bot shows the proposed target, category, consolidated content, dates, confidence, and reason. The registry is unchanged until **Approve** is pressed.
+
+Ordinary information uses the `note` category. New friend notes use this standard profile template:
+
+```text
+# <friend or project name>
+
+Current events:
+
+Upcoming events:
+
+Hobbies/interests:
+
+Siblings:
+
+Birthday:
+
+Likes:
+
+Dislikes:
+
+Relationship with family:
+```
+
+Project and uncategorized notes remain concise and do not use the friend-profile sections. On
+friend or project approval, the original `/add` text is appended to that entity's history with a
+server timestamp, while DeepSeek's merged content is stored as the one mutable current note.
+The friend profile sections are formatting inside the note's `content` string, not separate JSON
+fields.
+
+Only explicitly scheduled reminders use the separate `follow_up` category. Follow-ups do not
+replace the friend or project current note. Each follow-up requires a specific `follow_up_at`
+date/time, which drives reminder notifications. `/followups` shows all pending follow-ups, while
+`/next` retains a project-only follow-up view.
 
 If DeepSeek fails, the bot creates a proposed uncategorized inbox note instead. This fallback still requires approval.
+The confidence threshold defaults to 65%. DeepSeek is instructed to use it, and the bot also
+enforces it locally by changing lower-confidence proposal items into uncategorized inbox items.
+DeepSeek also converts relative time wording such as "today" or "tomorrow" to calendar dates.
+Ages are stored with an as-of date; an age alone is never used to infer an exact birth date.
 
 ### Approve button
 
 Callback data uses `proposal:approve:{token}`. `approve_pending()` runs one Firestore transaction that:
 
 - verifies the proposal exists, is still pending, and has not expired;
-- creates or updates any referenced friend/project and increments its note count;
-- saves each proposed note under a deterministic note ID;
-- stores follow-up timestamps in UTC and marks dated follow-ups or `next_action` notes as pending;
+- creates or updates any referenced friend/project;
+- appends the original input to each affected friend or project's timestamped history;
+- updates the one current note for each affected friend or project;
+- creates scheduled follow-ups as separate notes so they can be completed independently;
+- archives any older duplicate active notes for that entity and corrects its note count;
+- stores follow-up timestamps in UTC and marks `follow_up` items as pending;
 - stores a friend's birthday when one was proposed;
 - archives the source inbox note during reclassification; and
 - changes the proposal status to `approved`.
 
 Pressing Approve again is safe: an already-decided proposal is reported but not written twice.
+After a successful approval, the callback message identifies each note as saved or updated and
+shows the target name and resulting content instead of only displaying an internal note ID.
 
 ### Cancel button
 
@@ -101,12 +155,32 @@ users/{telegram-user-id}
   notification_log/{notification-id}
 ```
 
+Friend and project documents in `notes` use `record_type: note`, `history`, or `follow_up`. Each
+entity has one mutable current note, any number of timestamped history entries, and any number of
+independently completable follow-ups. Older friend records using `record_type: summary` remain
+readable and are converted to `note` when next updated.
+
 - Friend and project IDs are hashes of normalized names, so capitalization and repeated spaces do not create separate entities.
+- Each friend or project has at most one active current note, while its history entries accumulate.
+  Later approvals update the current note in place.
+  Uncategorized inbox notes are not deduplicated.
 - Telegram displays the first eight characters of note IDs. Commands accepting an ID require that prefix to match exactly one active note.
 - Archived notes are omitted from normal lists and searches.
-- Search uses DeepSeek to produce a structured plan and then ranks notes locally; if DeepSeek
-  fails, the bot falls back to a token-based local search plan.
+- Search uses DeepSeek to produce a structured plan, ranks notes locally, and sends only the
+  matching notes back to DeepSeek for a grounded natural-language answer. Planning failures use a
+  token-based local plan; answer-generation failures show the raw matching notes.
 - Firestore client rules deny direct access; the deployed Firebase Admin SDK performs these operations.
+
+## Local test environment
+
+The project's Python virtual environment is stored in `functions/venv`. From the repository root,
+activate it and run the unit tests with:
+
+```bash
+source functions/venv/bin/activate
+python -m unittest discover -v
+python -m compileall -q functions scripts tests
+```
 
 ## Relevant source files
 
