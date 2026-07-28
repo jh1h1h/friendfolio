@@ -230,6 +230,16 @@ class FirestoreRegistry:
         rows.sort(key=lambda item: _sort_time(item.get("created_at")), reverse=True)
         return rows[0] if rows else None
 
+    def get_pending_action(
+        self, owner_user_id: int, token: str
+    ) -> dict[str, Any] | None:
+        snapshot = self.collection(owner_user_id, "pending_actions").document(token).get()
+        if not snapshot.exists:
+            return None
+        data = snapshot.to_dict() or {}
+        data["id"] = snapshot.id
+        return data
+
     def set_pending_message(
         self, owner_user_id: int, token: str, chat_id: int, message_id: int
     ) -> bool:

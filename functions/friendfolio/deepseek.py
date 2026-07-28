@@ -62,8 +62,14 @@ Rules:
 
   Relationship with family:
 - Keep project and uncategorized note content concise and untemplated.
-- Only create a new name when the note clearly names that friend or project.
-- If the target is ambiguous, use target_type=uncategorized rather than guessing.
+- A person who is clearly named in new_note is a friend target even when their name is absent from
+  existing_friends. Produce a normal target_type=friend, category=note proposal so approval creates
+  their new friend record and current note.
+- Do not use target_type=uncategorized merely because a clearly named person is new. In reason,
+  explain that this will create a new friend note rather than update an existing friend note.
+- Apply the same rule to a clearly named new project when new_note identifies it as a project.
+- Only create a new name when new_note clearly names that friend or project. If the identity or
+  target type is genuinely ambiguous, use target_type=uncategorized rather than guessing.
 - Keep content faithful and concise. Never add facts that are absent from the note.
 - Only set follow_up_at for an explicit or clearly intended reminder/deadline. Return
   an ISO 8601 timestamp with UTC offset; use 09:00 when only a date is supplied.
@@ -191,10 +197,9 @@ class DeepSeekClassifier:
                 if not content:
                     raise ValueError("DeepSeek returned empty JSON content")
                 proposal = NoteProposal.model_validate_json(content)
-                proposal = self._apply_confidence_threshold(
+                return self._apply_confidence_threshold(
                     proposal, confidence_threshold
                 )
-                return self._apply_note_template(proposal)
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 self._emit_trace(
                     trace,
@@ -229,28 +234,20 @@ class DeepSeekClassifier:
         return NoteProposal.model_validate(payload)
 
     @classmethod
-    def _apply_note_template(cls, proposal: NoteProposal) -> NoteProposal:
-        payload = proposal.model_dump(mode="json")
-        for item in payload["items"]:
-            if item["category"] != "note" or item["target_type"] != "friend":
+    def missing_note_sections(cls, proposal: NoteProposal) -> dict[str, list[str]]:
+        missing: dict[str, list[str]] = {}
+        for item in proposal.items:
+            if item.category != "note" or item.target_type != "friend":
                 continue
-            content = item["content"].strip()
-            if all(section in content for section in cls.NOTE_SECTIONS):
-                continue
-            title = item["target_name"] or "Inbox"
-
-            def build_template(body: str) -> str:
-                sections = [f"# {title}", "", "Current events:", body]
-                for section in cls.NOTE_SECTIONS[1:]:
-                    sections.extend(["", section, ""])
-                return "\n".join(sections).rstrip()
-
-            templated = build_template(content)
-            if len(templated) > 3000:
-                content = content[: 3000 - (len(templated) - len(content))]
-                templated = build_template(content)
-            item["content"] = templated
-        return NoteProposal.model_validate(payload)
+            folded_content = item.content.casefold()
+            absent = [
+                section
+                for section in cls.NOTE_SECTIONS
+                if section.casefold() not in folded_content
+            ]
+            if absent:
+                missing[item.target_name] = absent
+        return missing
 
     def select_context(
         self,
@@ -354,9 +351,7 @@ class DeepSeekClassifier:
                 content = body["choices"][0]["message"]["content"]
                 if not content:
                     raise ValueError("DeepSeek returned empty JSON content")
-                return self._apply_note_template(
-                    NoteProposal.model_validate_json(content)
-                )
+                return NoteProposal.model_validate_json(content)
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 self._emit_trace(
                     trace,

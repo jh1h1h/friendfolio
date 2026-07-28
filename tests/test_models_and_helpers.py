@@ -119,18 +119,15 @@ class ModelAndHelperTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             NoteProposal.model_validate(payload)
 
-    def test_project_note_does_not_use_friend_template(self) -> None:
+    def test_missing_friend_sections_are_reported_without_changing_content(self) -> None:
         payload = proposal_payload()
-        payload["items"][0].update(  # type: ignore[index]
-            target_type="project",
-            target_name="Portfolio",
-            content="Prepare the launch plan.",
-        )
-        proposal = DeepSeekClassifier._apply_note_template(
-            NoteProposal.model_validate(payload)
-        )
+        proposal = NoteProposal.model_validate(payload)
 
-        self.assertEqual(proposal.items[0].content, "Prepare the launch plan.")
+        self.assertEqual(
+            DeepSeekClassifier.missing_note_sections(proposal)["Alice"],
+            list(DeepSeekClassifier.NOTE_SECTIONS),
+        )
+        self.assertEqual(proposal.items[0].content, "Alice started a new role.")
 
     def test_deepseek_request_uses_v4_flash_json_mode(self) -> None:
         captured: dict[str, object] = {}
@@ -159,9 +156,7 @@ class ModelAndHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(result.items[0].target_name, "Alice")
-        self.assertTrue(result.items[0].content.startswith("# Alice\n"))
-        self.assertIn("Current events:", result.items[0].content)
-        self.assertIn("Relationship with family:", result.items[0].content)
+        self.assertEqual(result.items[0].content, "Alice started a new role.")
         payload = json.loads(captured["messages"][1]["content"])  # type: ignore[index]
         self.assertEqual(
             payload["prior_context"][0]["follow_up_at"], "2026-07-24T13:00:00+00:00"
@@ -170,6 +165,11 @@ class ModelAndHelperTests(unittest.TestCase):
         self.assertIn("friend or project affected", system_prompt)
         self.assertIn("append-only history", system_prompt)
         self.assertIn("Format only friend", system_prompt)
+        self.assertIn("clearly named in new_note is a friend target", system_prompt)
+        self.assertIn(
+            "create a new friend note rather than update an existing friend note",
+            system_prompt,
+        )
         self.assertIn("relative time words", system_prompt)
         self.assertIn("age N as of YYYY-MM-DD", system_prompt)
         self.assertEqual(captured["model"], "deepseek-v4-flash")

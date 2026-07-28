@@ -9,7 +9,11 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "functions"))
 
-from friendfolio.handlers import BotHandlers, _is_context_note  # noqa: E402
+from friendfolio.handlers import (  # noqa: E402
+    BotHandlers,
+    _is_context_note,
+    _proposal_preview,
+)
 from friendfolio.models import (  # noqa: E402
     ContextSelection,
     NoteProposal,
@@ -139,6 +143,22 @@ class FakeRegistry:
                 return {**item, "id": item["token"]}
         return None
 
+    def get_pending_action(
+        self, user_id: int, token: str
+    ) -> dict[str, Any] | None:
+        del user_id
+        item = self.pending.get(token)
+        if item is None:
+            return None
+        proposal = item["proposal"]
+        return {
+            **item,
+            "id": token,
+            "proposal": proposal.model_dump(mode="json")
+            if isinstance(proposal, NoteProposal)
+            else proposal,
+        }
+
     def set_pending_message(self, user_id: int, token: str, chat_id: int, message_id: int) -> bool:
         del user_id
         item = self.pending.get(token)
@@ -233,6 +253,7 @@ class FakeClassifier:
             )
         payload = current_proposal.model_dump(mode="json")
         payload["summary"] = f"Revised: {instruction}"
+        payload["items"][0]["content"] += f" {instruction}"
         return NoteProposal.model_validate(payload)
 
     def search(self, query: str, *args: Any, **kwargs: Any) -> SearchPlan:
@@ -260,6 +281,70 @@ class FakeClassifier:
 
 
 class HandlerTests(unittest.TestCase):
+    def test_proposal_preview_shows_line_delta_with_preserved_line_breaks(self):
+        payload = proposal_payload()
+        payload["items"][0]["content"] = (  # type: ignore[index]
+            "Current events:\nplays Arknights\n\nLikes:\ndonuts"
+        )
+        proposal = NoteProposal.model_validate(payload)
+
+        preview = _proposal_preview(proposal, "America/New_York")
+
+        self.assertIn(
+            "+ Current events:\n+ plays Arknights\n+ \n+ Likes:\n+ donuts",
+            preview,
+        )
+
+    def test_proposal_preview_omits_unchanged_lines(self):
+        payload = proposal_payload()
+        payload["items"][0]["content"] = (  # type: ignore[index]
+            "Current events:\nnew role\n\nLikes:\nhiking"
+        )
+        proposal = NoteProposal.model_validate(payload)
+
+        preview = _proposal_preview(
+            proposal,
+            "America/New_York",
+            {
+                ("friend", "alice", "note"): (
+                    "Current events:\nold role\n\nLikes:\nhiking"
+                )
+            },
+        )
+
+        self.assertIn("- old role\n+ new role", preview)
+        self.assertNotIn("+ Likes:", preview)
+        self.assertNotIn("- Likes:", preview)
+
+    def test_proposal_preview_keeps_section_context_for_blank_line_change(self):
+        payload = proposal_payload()
+        payload["items"][0]["content"] = (  # type: ignore[index]
+            "Likes:\ndonuts\n\nDislikes:\n"
+        )
+        proposal = NoteProposal.model_validate(payload)
+
+        preview = _proposal_preview(
+            proposal,
+            "America/New_York",
+            {
+                ("friend", "alice", "note"): (
+                    "Likes:\n\n\nDislikes:\n"
+                )
+            },
+        )
+
+        self.assertIn("  Likes:\n- \n+ donuts\n  ", preview)
+        self.assertNotIn("+Likes:", preview)
+
+    def test_incomplete_friend_note_preview_warns_without_changing_proposal(self):
+        proposal = NoteProposal.model_validate(proposal_payload())
+
+        preview = _proposal_preview(proposal, "America/New_York")
+
+        self.assertTrue(preview.startswith("⚠️"))
+        self.assertIn("run the exact same <code>/add</code> command again", preview)
+        self.assertEqual(proposal.items[0].content, "Alice started a new role.")
+
     def test_context_note_filter_distinguishes_friend_and_project_records(self):
         self.assertTrue(_is_context_note({"record_type": "note"}, "friend"))
         self.assertTrue(_is_context_note({"record_type": "summary"}, "friend"))
@@ -292,7 +377,10 @@ class HandlerTests(unittest.TestCase):
             }
         )
         self.assertEqual(len(registry.staged), 1)
-        self.assertEqual(registry.context_requests, [(123, "friend", "Alice")])
+        self.assertEqual(
+            registry.context_requests,
+            [(123, "friend", "Alice"), (123, "friend", "Alice")],
+        )
         self.assertEqual(
             handlers.classifier.prior_context[0]["notes"][0]["content"],  # type: ignore[attr-defined]
             "Alice likes hiking.",
@@ -304,9 +392,10 @@ class HandlerTests(unittest.TestCase):
         )
         self.assertEqual(handlers.classifier.confidence_threshold, 0.65)  # type: ignore[attr-defined]
         self.assertIn("Proposed update", telegram.sent[0]["text"])
-        buttons = telegram.sent[0]["reply_markup"]["inline_keyboard"][0]
-        self.assertTrue(buttons[0]["callback_data"].startswith("proposal:approve:"))
-        self.assertLessEqual(len(buttons[0]["callback_data"]), 64)
+        rows = telegram.sent[0]["reply_markup"]["inline_keyboard"]
+        self.assertEqual(rows[0][0]["text"], "View full proposed note")
+        self.assertTrue(rows[1][0]["callback_data"].startswith("proposal:approve:"))
+        self.assertLessEqual(len(rows[1][0]["callback_data"]), 64)
 
     def test_add_debug_returns_trace_and_stages_proposal(self) -> None:
         handlers, telegram, registry = self.build()
@@ -399,6 +488,32 @@ class HandlerTests(unittest.TestCase):
         self.assertIn("likes hiking and started a new role", telegram.edits[0]["text"])
         self.assertEqual(telegram.edits[0]["parse_mode"], "HTML")
 
+    def test_view_proposal_button_sends_full_untruncated_content(self) -> None:
+        handlers, telegram, registry = self.build()
+        payload = proposal_payload()
+        payload["items"][0]["content"] = "x" * 1200  # type: ignore[index]
+        proposal = NoteProposal.model_validate(payload)
+        registry.pending["token-view"] = {
+            "proposal": proposal,
+            "status": "pending",
+        }
+
+        handlers.handle_update(
+            {
+                "callback_query": {
+                    "id": "callback-view",
+                    "data": "proposal:view:token-view",
+                    "from": {"id": 123},
+                    "message": {
+                        "message_id": 8,
+                        "chat": {"id": 123, "type": "private"},
+                    },
+                }
+            }
+        )
+
+        self.assertIn("x" * 1200, telegram.sent[0]["text"])
+
     def test_free_text_revises_the_pending_proposal(self) -> None:
         handlers, telegram, registry = self.build()
         handlers.handle_update(
@@ -424,7 +539,15 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(len(telegram.edits), 1)
         self.assertIn("Revised:", telegram.edits[0]["text"])
         self.assertEqual(registry.staged[0]["last_instruction"], "make it about her new manager role")
-        self.assertIn("Approve", telegram.edits[0]["reply_markup"]["inline_keyboard"][0][0]["text"])
+        self.assertIn("- Alice likes hiking.", telegram.edits[0]["text"])
+        self.assertIn(
+            "+ Alice started a new role. make it about her new manager role",
+            telegram.edits[0]["text"],
+        )
+        self.assertIn(
+            "Approve",
+            telegram.edits[0]["reply_markup"]["inline_keyboard"][1][0]["text"],
+        )
 
     def test_debug_proposal_automatically_traces_and_applies_steering(self) -> None:
         handlers, telegram, registry = self.build()

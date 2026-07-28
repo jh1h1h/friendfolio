@@ -26,6 +26,8 @@ Firebase Hosting is not needed; it hosts websites, whereas Telegram calls the fu
 - Project notes and scheduled project follow-ups.
 - Two-stage DeepSeek `/add`: resolve related entities, load their saved context, then propose a
   consolidated update with explicit **Approve**/**Cancel** buttons.
+- Proposal previews show line-level additions/removals, with a button to view the complete staged
+  note when needed.
 - Atomic, idempotent Firestore approval: retrying a webhook cannot duplicate approved notes.
 - DeepSeek-assisted semantic `/search` over notes and entities.
 - Uncategorized inbox with AI reclassification.

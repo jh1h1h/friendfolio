@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+from difflib import unified_diff
 from datetime import UTC
 from datetime import datetime, timedelta
 from typing import Any
@@ -76,15 +77,64 @@ def _now_in_timezone(timezone_name: str) -> datetime:
         return datetime.now(UTC)
 
 
-def _proposal_preview(proposal: NoteProposal, timezone_name: str) -> str:
-    lines = [f"<b>Proposed update</b> — {html.escape(proposal.summary)}", ""]
+def _content_delta(previous: str, proposed: str) -> str:
+    changes = [
+        line
+        for line in unified_diff(
+            previous.splitlines(),
+            proposed.splitlines(),
+            n=1,
+            lineterm="",
+        )
+        if not line.startswith(("---", "+++", "@@"))
+    ]
+    formatted = [f"{line[0]} {line[1:]}" for line in changes]
+    return "\n".join(formatted) if formatted else "(no content line changes)"
+
+
+def _split_text(value: str, limit: int = 4000) -> list[str]:
+    chunks = []
+    remaining = value
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        boundary = remaining.rfind("\n", 0, limit + 1)
+        if boundary <= 0:
+            boundary = limit
+        chunks.append(remaining[:boundary])
+        remaining = remaining[boundary:].lstrip("\n")
+    return chunks or [""]
+
+
+def _proposal_preview(
+    proposal: NoteProposal,
+    timezone_name: str,
+    previous_contents: dict[tuple[str, str, str], str] | None = None,
+) -> str:
+    lines = []
+    if DeepSeekClassifier.missing_note_sections(proposal):
+        lines.extend(
+            [
+                "⚠️ <b>Warning:</b> DeepSeek returned a friend note without all "
+                "expected sections. Review it carefully. If the output does not "
+                "make sense, cancel it and run the exact same <code>/add</code> "
+                "command again.",
+                "",
+            ]
+        )
+    lines.extend(
+        [f"<b>Proposed update</b> — {html.escape(proposal.summary)}", ""]
+    )
     for index, item in enumerate(proposal.items, 1):
         target = "Inbox" if item.target_type == "uncategorized" else item.target_name
         lines.append(
             f"<b>{index}. {html.escape(item.target_type.title())}: "
             f"{html.escape(target)}</b> · <code>{html.escape(item.category)}</code>"
         )
-        lines.append(html.escape(_short(item.content, 500)))
+        key = (item.target_type, item.target_name.casefold(), item.category)
+        previous = (previous_contents or {}).get(key, "")
+        lines.append(f"<pre>{html.escape(_content_delta(previous, item.content))}</pre>")
         details = []
         if item.birthday_mm_dd:
             details.append(f"birthday {item.birthday_mm_dd}")
@@ -108,6 +158,12 @@ def _proposal_preview(proposal: NoteProposal, timezone_name: str) -> str:
 def _approval_keyboard(token: str) -> dict[str, Any]:
     return {
         "inline_keyboard": [
+            [
+                {
+                    "text": "View full proposed note",
+                    "callback_data": f"proposal:view:{token}",
+                }
+            ],
             [
                 {"text": "Approve", "callback_data": f"proposal:approve:{token}"},
                 {"text": "Cancel", "callback_data": f"proposal:cancel:{token}"},
@@ -294,6 +350,36 @@ class BotHandlers:
             trace=trace.append if trace is not None else None,
         )
 
+    def _proposal_previous_contents(
+        self, user_id: int, proposal: NoteProposal
+    ) -> dict[tuple[str, str, str], str]:
+        previous: dict[tuple[str, str, str], str] = {}
+        loaded: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for item in proposal.items:
+            if item.target_type not in {"friend", "project"}:
+                continue
+            entity_key = (item.target_type, item.target_name.casefold())
+            if entity_key not in loaded:
+                _, notes = self.registry.get_entity_notes(
+                    user_id, item.target_type, item.target_name
+                )
+                loaded[entity_key] = notes
+            if item.category != "note":
+                continue
+            current = next(
+                (
+                    note
+                    for note in loaded[entity_key]
+                    if _is_context_note(note, item.target_type)
+                ),
+                None,
+            )
+            if current is not None:
+                previous[
+                    (item.target_type, item.target_name.casefold(), item.category)
+                ] = str(current.get("content", ""))
+        return previous
+
     def _send_debug_trace(
         self,
         chat_id: int,
@@ -390,9 +476,13 @@ class BotHandlers:
             )
             return
         prefix = "DeepSeek categorization failed. " if fallback else ""
+        previous_contents = self._proposal_previous_contents(user_id, proposal)
         sent = self.telegram.send(
             chat_id,
-            prefix + _proposal_preview(proposal, self.timezone_name),
+            prefix
+            + _proposal_preview(
+                proposal, self.timezone_name, previous_contents
+            ),
             parse_mode="HTML",
             reply_markup=_approval_keyboard(token),
         )
@@ -488,7 +578,11 @@ class BotHandlers:
             )
             return True
 
-        preview = _proposal_preview(revised, self.timezone_name)
+        preview = _proposal_preview(
+            revised,
+            self.timezone_name,
+            self._proposal_previous_contents(user_id, revised),
+        )
         message_id = pending.get("message_id")
         if isinstance(message_id, int):
             LOGGER.warning(
@@ -677,7 +771,11 @@ class BotHandlers:
             return
         sent = self.telegram.send(
             chat_id,
-            _proposal_preview(proposal, self.timezone_name),
+            _proposal_preview(
+                proposal,
+                self.timezone_name,
+                self._proposal_previous_contents(user_id, proposal),
+            ),
             parse_mode="HTML",
             reply_markup=_approval_keyboard(token),
         )
@@ -838,6 +936,32 @@ class BotHandlers:
             return
         kind, action, value = parts
         if kind == "proposal":
+            if action == "view":
+                pending = self.registry.get_pending_action(user_id, value)
+                if pending is None:
+                    self.telegram.send(chat_id, "This proposal no longer exists.")
+                    return
+                if str(pending.get("status", "missing")) != "pending":
+                    self.telegram.send(
+                        chat_id,
+                        f"This proposal is {pending.get('status', 'missing')}.",
+                    )
+                    return
+                proposal = NoteProposal.model_validate(pending["proposal"])
+                for index, item in enumerate(proposal.items, 1):
+                    target = (
+                        "Inbox"
+                        if item.target_type == "uncategorized"
+                        else item.target_name
+                    )
+                    full_text = (
+                        f"Full proposed note {index}/{len(proposal.items)}\n"
+                        f"{item.target_type.title()}: {target} · {item.category}\n\n"
+                        f"{item.content}"
+                    )
+                    for chunk in _split_text(full_text):
+                        self.telegram.send(chat_id, chunk)
+                return
             if action == "approve":
                 status, saved_notes = self.registry.approve_pending(user_id, value)
                 if status == "approved":

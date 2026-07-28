@@ -56,16 +56,23 @@ automatically emits revision traces and updates the staged proposal and Telegram
 4. `DeepSeekClassifier.classify()` receives the new input and selected current-note context, then
    proposes the resulting updated note. History remains stored locally and is not sent as context.
    Useful prior facts are preserved unless corrected or superseded by the new note.
+   A clearly named person or project that is not already in Firestore becomes a proposed new entity
+   note; being absent from the existing-name list alone does not send it to the uncategorized inbox.
 5. The returned JSON is validated as a `NoteProposal`. One input can affect several entities.
 6. A deterministic proposal token is calculated from the Telegram user ID and update ID. This prevents a retried Telegram update from creating duplicate proposals.
 7. The proposal is stored in `pending_actions/{token}` with `status: pending` and an expiry time, normally 24 hours.
-8. The bot shows the proposed target, category, consolidated content, dates, confidence, and reason. The registry is unchanged until **Approve** is pressed.
+8. The bot shows the proposed target, category, changed content lines, dates, confidence, and reason.
+   Removed lines use `-` and added lines use `+`. Each changed block retains one surrounding context
+   line so a value added to an empty section still displays its section heading; unrelated unchanged
+   lines are omitted. **View full proposed note** sends the complete latest staged content in
+   Telegram-safe chunks. The registry is unchanged until **Approve** is pressed.
+   Every delta, including after steering a proposal, compares the latest proposed note against the
+   current Firestore note. It therefore shows the final effect approval would have and omits
+   intermediate proposal mistakes.
 
 Ordinary information uses the `note` category. New friend notes use this standard profile template:
 
 ```text
-# <friend or project name>
-
 Current events:
 
 Upcoming events:
@@ -87,7 +94,9 @@ Project and uncategorized notes remain concise and do not use the friend-profile
 friend or project approval, the original `/add` text is appended to that entity's history with a
 server timestamp, while DeepSeek's merged content is stored as the one mutable current note.
 The friend profile sections are formatting inside the note's `content` string, not separate JSON
-fields.
+fields. If DeepSeek omits an expected section, the bot does not rebuild or otherwise change the
+content. It places a warning before the normal proposal so the user can review, cancel, and retry
+the same `/add` command when necessary. Section detection is case-insensitive.
 
 Only explicitly scheduled reminders use the separate `follow_up` category. Follow-ups do not
 replace the friend or project current note. Each follow-up requires a specific `follow_up_at`
