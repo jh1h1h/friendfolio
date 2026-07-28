@@ -49,7 +49,7 @@ def _handlers(require_deepseek: bool = True) -> BotHandlers:
     registry = FirestoreRegistry(firestore.client(), timezone_name)
     classifier = DeepSeekClassifier(
         os.environ.get("DEEPSEEK_API_KEY", "unused" if not require_deepseek else ""),
-        os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+        os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"),
         timezone_name,
     )
     try:
