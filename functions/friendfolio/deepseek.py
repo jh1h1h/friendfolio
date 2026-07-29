@@ -162,6 +162,7 @@ class DeepSeekClassifier:
         "Likes:",
         "Dislikes:",
         "Relationship with family:",
+        "Lives at:"
     )
 
     def __init__(self, api_key: str, model: str, timezone: str) -> None:
