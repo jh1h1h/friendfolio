@@ -9,6 +9,88 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 TargetType = Literal["friend", "project", "uncategorized"]
 Category = Literal["note", "follow_up"]
+EditAction = Literal["append", "merge", "replace", "delete"]
+
+
+class NoteEditOperation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: EditAction
+    section: str | None = Field(default=None, max_length=80)
+    match: str | None = Field(default=None, max_length=1000)
+    content: str | None = Field(default=None, max_length=3000)
+    source_quote: str = Field(min_length=1, max_length=1000)
+    reason: str = Field(min_length=1, max_length=300)
+
+    @field_validator("section", "match", "content")
+    @classmethod
+    def strip_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @field_validator("source_quote", "reason")
+    @classmethod
+    def strip_required_text(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def validate_action_fields(self) -> "NoteEditOperation":
+        if self.action == "append" and not self.content:
+            raise ValueError("append requires content")
+        if self.action in {"merge", "replace"} and (
+            not self.match or not self.content
+        ):
+            raise ValueError(f"{self.action} requires match and content")
+        if self.action == "delete" and not self.match:
+            raise ValueError("delete requires match")
+        return self
+
+
+class OperationProposalItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_type: TargetType
+    target_name: str = Field(max_length=120)
+    category: Category
+    operations: list[NoteEditOperation] = Field(default_factory=list, max_length=20)
+    content: str | None = Field(default=None, max_length=3000)
+    occurred_on: date | None
+    follow_up_at: datetime | None
+    birthday_mm_dd: str | None
+    confidence: float = Field(ge=0, le=1)
+    reason: str = Field(min_length=1, max_length=300)
+
+    @model_validator(mode="after")
+    def validate_operation_item(self) -> "OperationProposalItem":
+        if self.target_type == "uncategorized":
+            self.target_name = ""
+            self.category = "note"
+            self.birthday_mm_dd = None
+        elif not self.target_name.strip():
+            raise ValueError("target_name is required for a friend or project")
+        if self.birthday_mm_dd:
+            ProposalItem.valid_birthday(self.birthday_mm_dd)
+            if self.target_type != "friend":
+                raise ValueError("birthdays can only be assigned to friends")
+        if self.follow_up_at is not None:
+            self.category = "follow_up"
+        if self.category == "follow_up":
+            if self.follow_up_at is None or not self.content:
+                raise ValueError("follow_up requires content and follow_up_at")
+            if self.operations:
+                raise ValueError("follow_up cannot contain note operations")
+        elif not self.operations:
+            raise ValueError("note items require at least one operation")
+        return self
+
+
+class OperationProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1, max_length=300)
+    items: list[OperationProposalItem] = Field(min_length=1, max_length=8)
 
 
 class ProposalItem(BaseModel):

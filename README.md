@@ -24,8 +24,10 @@ Firebase Hosting is not needed; it hosts websites, whereas Telegram calls the fu
 - Friend notes use a structured profile template; project notes remain concise and free-form.
 - Durable time references: relative dates and ages are anchored to explicit calendar dates.
 - Project notes and scheduled project follow-ups.
-- Two-stage DeepSeek `/add`: resolve related entities, load their saved context, then propose a
-  consolidated update with explicit **Approve**/**Cancel** buttons.
+- Multi-stage DeepSeek `/add`: resolve related entities, load their saved context, draft operations,
+  verify them, then show the resulting update with explicit **Approve**/**Cancel** buttons.
+- DeepSeek proposes append/merge/replace/delete operations instead of rewriting whole notes; a
+  second model pass checks completeness and unsupported edits before Python applies them.
 - Proposal previews show line-level additions/removals, with a button to view the complete staged
   note when needed.
 - Atomic, idempotent Firestore approval: retrying a webhook cannot duplicate approved notes.
@@ -46,7 +48,7 @@ not automatically cap spending. If you are not the billing-account owner, ask th
 configure Blaze and the budget rather than attaching payment details without permission.
 
 DeepSeek is much cheaper than the OpenAI model previously configured, but it is still a paid API
-requiring a DeepSeek API key and balance. This project defaults to `deepseek-v4-flash`; DeepSeek says
+requiring a DeepSeek API key and balance. This project defaults to `deepseek-v4-pro`; DeepSeek says
 the older `deepseek-chat` name will be retired on 24 July 2026.
 
 There is an important privacy trade-off. Your `/add` text and existing friend/project names are sent
@@ -101,7 +103,7 @@ Edit `functions/.env`:
 ```dotenv
 TELEGRAM_ALLOWED_USER_IDS=0
 APP_TIMEZONE=Asia/Singapore
-DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_MODEL=deepseek-v4-pro
 BIRTHDAY_REMINDER_DAYS=7,1,0
 PENDING_EXPIRY_HOURS=24
 ```

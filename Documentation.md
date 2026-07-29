@@ -54,14 +54,19 @@ automatically emits revision traces and updates the staged proposal and Telegram
 3. The handler validates those names against Firestore and loads each selected friend or project's
    current note.
 4. `DeepSeekClassifier.classify()` receives the new input and selected current-note context, then
-   proposes the resulting updated note. History remains stored locally and is not sent as context.
-   Useful prior facts are preserved unless corrected or superseded by the new note.
+   proposes `append`, `merge`, `replace`, or `delete` operations rather than rewriting the note.
+   History remains stored locally and is not sent as context.
    A clearly named person or project that is not already in Firestore becomes a proposed new entity
    note; being absent from the existing-name list alone does not send it to the uncategorized inbox.
-5. The returned JSON is validated as a `NoteProposal`. One input can affect several entities.
-6. A deterministic proposal token is calculated from the Telegram user ID and update ID. This prevents a retried Telegram update from creating duplicate proposals.
-7. The proposal is stored in `pending_actions/{token}` with `status: pending` and an expiry time, normally 24 hours.
-8. The bot shows the proposed target, category, changed content lines, dates, confidence, and reason.
+5. A second DeepSeek request audits the operations for missing details, broad paraphrasing,
+   unsupported additions, unsafe deletion, and lost information. It returns the minimally corrected
+   operation proposal.
+6. Python validates every operation and applies it deterministically. `merge`, `replace`, and
+   `delete` must identify exactly one existing line or multi-line block. The resulting full notes
+   are validated as a `NoteProposal`; one input can affect several entities.
+7. A deterministic proposal token is calculated from the Telegram user ID and update ID. This prevents a retried Telegram update from creating duplicate proposals.
+8. The proposal is stored in `pending_actions/{token}` with `status: pending` and an expiry time, normally 24 hours.
+9. The bot shows the proposed target, category, changed content lines, dates, confidence, and reason.
    Removed lines use `-` and added lines use `+`. Each changed block retains one surrounding context
    line so a value added to an empty section still displays its section heading; unrelated unchanged
    lines are omitted. **View full proposed note** sends the complete latest staged content in
@@ -89,6 +94,12 @@ Dislikes:
 
 Relationship with family:
 ```
+
+Within a section, Python normally stores facts as bullets. `append` creates a new bullet. `merge`
+groups a related fact into one existing topic bullet while requiring the complete replacement to
+preserve both old and new details. `replace` is reserved for corrections or state transitions.
+`delete` requires an explicit removal or false-information instruction and removes only one
+uniquely matched line or multi-line block. Every operation carries a verbatim `source_quote`.
 
 Project and uncategorized notes remain concise and do not use the friend-profile sections. On
 friend or project approval, the original `/add` text is appended to that entity's history with a

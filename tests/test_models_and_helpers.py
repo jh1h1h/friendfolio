@@ -15,7 +15,9 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "functions"))
 from friendfolio.deepseek import API_URL, DeepSeekClassifier  # noqa: E402
 from friendfolio.models import (  # noqa: E402
     ContextSelection,
+    NoteEditOperation,
     NoteProposal,
+    OperationProposal,
     ProposalItem,
     SearchAnswer,
 )
@@ -32,6 +34,42 @@ def proposal_payload() -> dict[str, object]:
                 "target_name": "Alice",
                 "category": "note",
                 "content": "Alice started a new role.",
+                "occurred_on": None,
+                "follow_up_at": None,
+                "birthday_mm_dd": None,
+                "confidence": 0.97,
+                "reason": "Alice is explicitly named.",
+            }
+        ],
+    }
+
+
+def operation_payload(
+    action: str = "append",
+    *,
+    section: str = "Current events",
+    match: str | None = None,
+    content: str | None = "Alice started a new role.",
+    source_quote: str = "Alice started a new role",
+) -> dict[str, object]:
+    return {
+        "summary": "Update Alice's note",
+        "items": [
+            {
+                "target_type": "friend",
+                "target_name": "Alice",
+                "category": "note",
+                "operations": [
+                    {
+                        "action": action,
+                        "section": section,
+                        "match": match,
+                        "content": content,
+                        "source_quote": source_quote,
+                        "reason": "The source explicitly supports this edit.",
+                    }
+                ],
+                "content": None,
                 "occurred_on": None,
                 "follow_up_at": None,
                 "birthday_mm_dd": None,
@@ -119,6 +157,111 @@ class ModelAndHelperTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             NoteProposal.model_validate(payload)
 
+    def test_note_operations_append_merge_replace_and_delete(self) -> None:
+        prior = [
+            {
+                "target_type": "friend",
+                "target_name": "Alice",
+                "notes": [
+                    {
+                        "category": "note",
+                        "content": (
+                            "Current events:\n- Applying to GovTech\n\n"
+                            "Upcoming events:\n\n"
+                            "Hobbies/interests:\n- Arknights — plays regularly\n\n"
+                            "Siblings:\n\nBirthday:\n\nLikes:\n- tea\n\n"
+                            "Dislikes:\n\nRelationship with family:"
+                        ),
+                    }
+                ],
+            }
+        ]
+        payload = operation_payload(
+            "merge",
+            section="Hobbies/interests",
+            match="Arknights",
+            content="Arknights — plays regularly and follows upcoming events",
+        )
+        operations = payload["items"][0]["operations"]  # type: ignore[index]
+        operations.extend(  # type: ignore[union-attr]
+            [
+                {
+                    "action": "append",
+                    "section": "Likes",
+                    "match": None,
+                    "content": "donuts",
+                    "source_quote": "likes donuts",
+                    "reason": "New preference.",
+                },
+                {
+                    "action": "replace",
+                    "section": "Current events",
+                    "match": "Applying to GovTech",
+                    "content": "Rejected by GovTech on July 24, 2026",
+                    "source_quote": "rejected by GovTech",
+                    "reason": "State changed.",
+                },
+                {
+                    "action": "delete",
+                    "section": "Likes",
+                    "match": "tea",
+                    "content": None,
+                    "source_quote": "remove tea",
+                    "reason": "Explicit removal.",
+                },
+            ]
+        )
+
+        proposal = DeepSeekClassifier._materialize_operations(
+            OperationProposal.model_validate(payload),
+            prior,
+        )
+
+        content = proposal.items[0].content
+        self.assertIn(
+            "- Arknights — plays regularly and follows upcoming events", content
+        )
+        self.assertIn("- donuts", content)
+        self.assertIn("- Rejected by GovTech on July 24, 2026", content)
+        self.assertNotIn("- tea", content)
+        self.assertNotIn("Applying to GovTech", content)
+
+    def test_delete_requires_a_match(self) -> None:
+        with self.assertRaises(ValidationError):
+            NoteEditOperation.model_validate(
+                {
+                    "action": "delete",
+                    "section": "Likes",
+                    "match": None,
+                    "content": None,
+                    "source_quote": "remove it",
+                    "reason": "Explicit removal.",
+                }
+            )
+
+    def test_project_delete_can_match_a_multiline_block(self) -> None:
+        removable = (
+            "Deepseek still makes a lot of mistakes. Ask Codex for suggestions.\n\n"
+            "Also prefer adding a new row unless needing to merge things."
+        )
+        current = f"Keep this first paragraph.\n\n{removable}"
+        operation = NoteEditOperation(
+            action="delete",
+            section=None,
+            match=removable,
+            content=None,
+            source_quote=f"remove `{removable}`",
+            reason="Explicit removal.",
+        )
+
+        result = DeepSeekClassifier._apply_operations(
+            current,
+            "project",
+            [operation],
+        )
+
+        self.assertEqual(result, "Keep this first paragraph.")
+
     def test_missing_friend_sections_are_reported_without_changing_content(self) -> None:
         payload = proposal_payload()
         proposal = NoteProposal.model_validate(payload)
@@ -129,16 +272,16 @@ class ModelAndHelperTests(unittest.TestCase):
         )
         self.assertEqual(proposal.items[0].content, "Alice started a new role.")
 
-    def test_deepseek_request_uses_v4_flash_json_mode(self) -> None:
-        captured: dict[str, object] = {}
+    def test_deepseek_request_uses_configured_model_and_json_mode(self) -> None:
+        captured: list[dict[str, object]] = []
 
         def responder(request: httpx.Request) -> httpx.Response:
-            captured.update(json.loads(request.content))
+            captured.append(json.loads(request.content))
             return httpx.Response(
                 200,
                 json={
                     "choices": [
-                        {"message": {"content": json.dumps(proposal_payload())}}
+                        {"message": {"content": json.dumps(operation_payload())}}
                     ]
                 },
             )
@@ -156,15 +299,17 @@ class ModelAndHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(result.items[0].target_name, "Alice")
-        self.assertEqual(result.items[0].content, "Alice started a new role.")
-        payload = json.loads(captured["messages"][1]["content"])  # type: ignore[index]
+        self.assertIn("- Alice started a new role.", result.items[0].content)
+        self.assertIn("Relationship with family:", result.items[0].content)
+        payload = json.loads(captured[0]["messages"][1]["content"])  # type: ignore[index]
         self.assertEqual(
             payload["prior_context"][0]["follow_up_at"], "2026-07-24T13:00:00+00:00"
         )
-        system_prompt = captured["messages"][0]["content"]  # type: ignore[index]
-        self.assertIn("friend or project affected", system_prompt)
+        system_prompt = captured[0]["messages"][0]["content"]  # type: ignore[index]
+        self.assertIn("small edit operations", system_prompt)
         self.assertIn("append-only history", system_prompt)
-        self.assertIn("Format only friend", system_prompt)
+        self.assertIn("Prefer adding a new bullet", system_prompt)
+        self.assertIn("Use delete only", system_prompt)
         self.assertIn("clearly named in new_note is a friend target", system_prompt)
         self.assertIn(
             "create a new friend note rather than update an existing friend note",
@@ -172,9 +317,12 @@ class ModelAndHelperTests(unittest.TestCase):
         )
         self.assertIn("relative time words", system_prompt)
         self.assertIn("age N as of YYYY-MM-DD", system_prompt)
-        self.assertEqual(captured["model"], "deepseek-v4-flash")
-        self.assertEqual(captured["response_format"], {"type": "json_object"})
-        self.assertEqual(captured["thinking"], {"type": "disabled"})
+        self.assertEqual(len(captured), 2)
+        verification_prompt = captured[1]["messages"][0]["content"]  # type: ignore[index]
+        self.assertIn("audit proposed note edit operations", verification_prompt)
+        self.assertEqual(captured[0]["model"], "deepseek-v4-flash")
+        self.assertEqual(captured[0]["response_format"], {"type": "json_object"})
+        self.assertEqual(captured[0]["thinking"], {"type": "disabled"})
 
     def test_deepseek_selects_context_before_classification(self) -> None:
         captured: dict[str, object] = {}
@@ -209,7 +357,7 @@ class ModelAndHelperTests(unittest.TestCase):
         self.assertEqual(payload["existing_friends"], ["Alice"])
 
     def test_low_confidence_proposal_is_sent_to_inbox(self) -> None:
-        payload = proposal_payload()
+        payload = operation_payload()
         payload["items"][0]["confidence"] = 0.6  # type: ignore[index]
 
         def responder(request: httpx.Request) -> httpx.Response:
