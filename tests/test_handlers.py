@@ -12,10 +12,17 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "functions"))
 from friendfolio.handlers import (  # noqa: E402
     BotHandlers,
     _is_context_note,
+    _proposal_failure_message,
     _proposal_preview,
+)
+from friendfolio.errors import (  # noqa: E402
+    DeepSeekAPIError,
+    DeepSeekResponseError,
+    NoteOperationError,
 )
 from friendfolio.models import (  # noqa: E402
     ContextSelection,
+    FriendNoteMigrationProposal,
     NoteProposal,
     SearchAnswer,
     SearchPlan,
@@ -61,6 +68,7 @@ class FakeRegistry:
         ]
         self.context_requests: list[tuple[int, str, str]] = []
         self.confidence_threshold = 0.65
+        self.migrations: dict[str, dict[str, Any]] = {}
         self.approval_results: list[dict[str, str]] = [
             {
                 "id": "note1234",
@@ -167,6 +175,16 @@ class FakeRegistry:
         item.update({"chat_id": chat_id, "message_id": message_id})
         return True
 
+    def set_pending_error_report(
+        self, user_id: int, token: str, error_report: dict[str, Any]
+    ) -> bool:
+        del user_id
+        item = self.pending.get(token)
+        if not item:
+            return False
+        item["error_report"] = error_report
+        return True
+
     def revise_pending(
         self, user_id: int, token: str, proposal: NoteProposal, instruction: str
     ) -> str:
@@ -175,6 +193,32 @@ class FakeRegistry:
         if not item:
             return "missing"
         item.update({"proposal": proposal, "last_instruction": instruction})
+        return "pending"
+
+    def begin_pending_manual_edit(
+        self, user_id: int, token: str, item_index: int
+    ) -> str:
+        del user_id
+        item = self.pending.get(token)
+        if not item:
+            return "missing"
+        item["manual_edit_item_index"] = item_index
+        return "pending"
+
+    def replace_pending_item(
+        self,
+        user_id: int,
+        token: str,
+        proposal: NoteProposal,
+        item_index: int,
+    ) -> str:
+        del user_id
+        item = self.pending.get(token)
+        if not item or item.get("manual_edit_item_index") != item_index:
+            return "invalid"
+        item["proposal"] = proposal
+        item.pop("manual_edit_item_index", None)
+        item["last_instruction"] = "Manual full-note replacement"
         return "pending"
 
     def cancel_pending(self, owner_user_id: int, token: str) -> str:
@@ -190,6 +234,74 @@ class FakeRegistry:
     ) -> tuple[str, list[dict[str, str]]]:
         del owner_user_id, token
         return "approved", self.approval_results
+
+    def migration_candidates(
+        self, user_id: int, migration_id: str
+    ) -> tuple[list[dict[str, Any]], int]:
+        del user_id
+        if migration_id != "friend-notes-v1":
+            raise ValueError("unknown migration")
+        return (
+            [
+                {
+                    "id": "alice-note",
+                    "expected_hash": "alice-hash",
+                    "content": "Current events:\n- Lives in Singapore",
+                    "target_name": "Alice",
+                    "new_sections": ["Lives at:"],
+                },
+                {
+                    "id": "bob-note",
+                    "expected_hash": "bob-hash",
+                    "content": "Current events:\n- Started work",
+                    "target_name": "Bob",
+                    "new_sections": ["Lives at:"],
+                },
+            ],
+            0,
+        )
+
+    def stage_migration(
+        self,
+        user_id: int,
+        migration_id: str,
+        changes: list[dict[str, Any]],
+        remaining_count: int,
+        expiry_hours: int,
+    ) -> tuple[str, dict[str, Any]]:
+        del user_id, expiry_hours
+        token = "migration-token"
+        self.migrations[token] = {
+            "status": "pending",
+            "migration_id": migration_id,
+            "changes": changes,
+            "remaining_count": remaining_count,
+        }
+        return token, {
+            "migration_id": migration_id,
+            "description": "Add every current friend-note section",
+            "change_count": len(changes),
+            "remaining_count": remaining_count,
+        }
+
+    def get_migration_action(
+        self, user_id: int, token: str
+    ) -> dict[str, Any] | None:
+        del user_id
+        return self.migrations.get(token)
+
+    def decide_migration(
+        self, user_id: int, token: str, apply: bool
+    ) -> tuple[str, dict[str, int]]:
+        del user_id
+        migration = self.migrations.get(token)
+        if migration is None:
+            return "missing", {}
+        migration["status"] = "applied" if apply else "cancelled"
+        return (
+            str(migration["status"]),
+            {"updated": 2, "skipped": 0} if apply else {},
+        )
 
     def search_notes(
         self,
@@ -210,6 +322,7 @@ class FakeClassifier:
         self.confidence_threshold = 0.0
         self.search_context: list[dict[str, Any]] = []
         self.classification_error = False
+        self.revision_error = False
 
     def select_context(self, *args: Any, **kwargs: Any) -> ContextSelection:
         del args
@@ -251,6 +364,8 @@ class FakeClassifier:
                     "raw_response": '{"summary":"Revised proposal"}',
                 }
             )
+        if self.revision_error:
+            raise RuntimeError("simulated revision rejection")
         payload = current_proposal.model_dump(mode="json")
         payload["summary"] = f"Revised: {instruction}"
         payload["items"][0]["content"] += f" {instruction}"
@@ -279,8 +394,141 @@ class FakeClassifier:
         self.search_context = matching_notes
         return SearchAnswer(answer="Alice started a new role.")
 
+    def migrate_friend_notes(
+        self, notes: list[dict[str, str]], new_sections: list[str]
+    ) -> FriendNoteMigrationProposal:
+        del new_sections
+        items = []
+        for note in notes:
+            content = note["content"]
+            if note["note_id"] == "alice-note":
+                content = "Current events:\n\nLives at:\n• Singapore"
+            else:
+                content += "\n\nLives at:"
+            items.append(
+                {
+                    "note_id": note["note_id"],
+                    "content": content,
+                    "reason": "Moved residence into Lives at."
+                    if note["note_id"] == "alice-note"
+                    else "Added a blank Lives at section.",
+                }
+            )
+        return FriendNoteMigrationProposal.model_validate({"items": items})
+
 
 class HandlerTests(unittest.TestCase):
+    def test_migrate_previews_then_applies_with_callback(self) -> None:
+        handlers, telegram, registry = self.build()
+        handlers.handle_update(
+            {
+                "update_id": 108,
+                "message": {
+                    "text": "/migrate friend-notes-v1",
+                    "from": {"id": 123},
+                    "chat": {"id": 123, "type": "private"},
+                },
+            }
+        )
+
+        preview = telegram.sent[-1]
+        self.assertIn("Migration preview", preview["text"])
+        self.assertIn("1/2", preview["text"])
+        self.assertIn("Alice", preview["text"])
+        self.assertIn("- - Lives in Singapore", preview["text"])
+        self.assertIn("+ • Singapore", preview["text"])
+        next_button = preview["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(
+            next_button["callback_data"], "migration:page:migration-token.1"
+        )
+        content_button = preview["reply_markup"]["inline_keyboard"][1][0]
+        self.assertEqual(content_button["text"], "View full new note")
+        self.assertEqual(
+            content_button["callback_data"],
+            "migration:content:migration-token.0",
+        )
+
+        handlers.handle_update(
+            {
+                "callback_query": {
+                    "id": "migration-content",
+                    "from": {"id": 123},
+                    "data": content_button["callback_data"],
+                    "message": {
+                        "message_id": 10,
+                        "chat": {"id": 123, "type": "private"},
+                    },
+                }
+            }
+        )
+        self.assertIn("Proposed new note 1/2 · Alice", telegram.sent[-1]["text"])
+        self.assertIn("Lives at:\n• Singapore", telegram.sent[-1]["text"])
+        self.assertNotIn("- - Lives in Singapore", telegram.sent[-1]["text"])
+
+        handlers.handle_update(
+            {
+                "callback_query": {
+                    "id": "migration-next",
+                    "from": {"id": 123},
+                    "data": next_button["callback_data"],
+                    "message": {
+                        "message_id": 10,
+                        "chat": {"id": 123, "type": "private"},
+                    },
+                }
+            }
+        )
+
+        self.assertIn("2/2", telegram.edits[-1]["text"])
+        self.assertIn("Bob", telegram.edits[-1]["text"])
+        previous = telegram.edits[-1]["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(
+            previous["callback_data"], "migration:page:migration-token.0"
+        )
+        button = preview["reply_markup"]["inline_keyboard"][2][0]
+        self.assertEqual(
+            button["callback_data"], "migration:apply:migration-token"
+        )
+
+        handlers.handle_update(
+            {
+                "callback_query": {
+                    "id": "migration-callback",
+                    "from": {"id": 123},
+                    "data": button["callback_data"],
+                    "message": {
+                        "message_id": 10,
+                        "chat": {"id": 123, "type": "private"},
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(registry.migrations["migration-token"]["status"], "applied")
+        self.assertIn("2 updated, 0 skipped", telegram.edits[-1]["text"])
+
+    def test_proposal_failure_messages_distinguish_failure_types(self) -> None:
+        self.assertIn(
+            "could not be reached",
+            _proposal_failure_message(DeepSeekAPIError("request failed")),
+        )
+        self.assertIn(
+            "invalid response",
+            _proposal_failure_message(DeepSeekResponseError("invalid JSON")),
+        )
+        self.assertIn(
+            "did not exactly match",
+            _proposal_failure_message(
+                NoteOperationError("not found", action="delete", match_count=0)
+            ),
+        )
+        self.assertIn(
+            "matched more than one place",
+            _proposal_failure_message(
+                NoteOperationError("ambiguous", action="replace", match_count=2)
+            ),
+        )
+
     def test_proposal_preview_shows_line_delta_with_preserved_line_breaks(self):
         payload = proposal_payload()
         payload["items"][0]["content"] = (  # type: ignore[index]
@@ -394,8 +642,63 @@ class HandlerTests(unittest.TestCase):
         self.assertIn("Proposed update", telegram.sent[0]["text"])
         rows = telegram.sent[0]["reply_markup"]["inline_keyboard"]
         self.assertEqual(rows[0][0]["text"], "View full proposed note")
-        self.assertTrue(rows[1][0]["callback_data"].startswith("proposal:approve:"))
-        self.assertLessEqual(len(rows[1][0]["callback_data"]), 64)
+        self.assertEqual(rows[1][0]["text"], "Manually edit Alice")
+        self.assertTrue(rows[2][0]["callback_data"].startswith("proposal:approve:"))
+        self.assertLessEqual(len(rows[2][0]["callback_data"]), 64)
+
+    def test_manual_edit_replaces_staged_note_then_requires_approval(self) -> None:
+        handlers, telegram, registry = self.build()
+        handlers.handle_update(
+            {
+                "update_id": 109,
+                "message": {
+                    "text": "/add Alice started a new role",
+                    "from": {"id": 123},
+                    "chat": {"id": 123, "type": "private"},
+                },
+            }
+        )
+        staged = registry.staged[0]
+        token = staged["token"]
+        manual_button = telegram.sent[-1]["reply_markup"]["inline_keyboard"][1][0]
+
+        handlers.handle_update(
+            {
+                "callback_query": {
+                    "id": "manual-edit",
+                    "from": {"id": 123},
+                    "data": manual_button["callback_data"],
+                    "message": {
+                        "message_id": staged["message_id"],
+                        "chat": {"id": 123, "type": "private"},
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(staged["manual_edit_item_index"], 0)
+        self.assertIn("Send the full replacement note", telegram.edits[-1]["text"])
+        self.assertNotIn("reply_markup", telegram.edits[-1])
+
+        replacement = "Current events:\n- Manually rewritten\n\nLikes:\n- tea"
+        handlers.handle_update(
+            {
+                "update_id": 110,
+                "message": {
+                    "text": replacement,
+                    "from": {"id": 123},
+                    "chat": {"id": 123, "type": "private"},
+                },
+            }
+        )
+
+        self.assertNotIn("manual_edit_item_index", staged)
+        self.assertEqual(staged["proposal"].items[0].content, replacement)
+        self.assertIn("Confirm manual replacement", telegram.edits[-1]["text"])
+        self.assertIn("+ - Manually rewritten", telegram.edits[-1]["text"])
+        approval = telegram.edits[-1]["reply_markup"]["inline_keyboard"][-1][0]
+        self.assertEqual(approval["text"], "Approve")
+        self.assertEqual(approval["callback_data"], f"proposal:approve:{token}")
 
     def test_add_debug_returns_trace_and_stages_proposal(self) -> None:
         handlers, telegram, registry = self.build()
@@ -431,6 +734,95 @@ class HandlerTests(unittest.TestCase):
 
         self.assertEqual(registry.staged, [])
         self.assertTrue(any("simulated DeepSeek failure" in item["text"] for item in telegram.sent))
+
+    def test_failed_add_offers_exact_error_details_button(self) -> None:
+        handlers, telegram, registry = self.build()
+        handlers.classifier.classification_error = True  # type: ignore[attr-defined]
+        handlers.handle_update(
+            {
+                "update_id": 111,
+                "message": {
+                    "text": "/add Alice update",
+                    "from": {"id": 123},
+                    "chat": {"id": 123, "type": "private"},
+                },
+            }
+        )
+
+        self.assertEqual(len(registry.staged), 1)
+        report = registry.staged[0]["error_report"]
+        self.assertEqual(
+            report["exception_chain"][0]["message"],
+            "simulated DeepSeek failure",
+        )
+        self.assertIn("raw_response", report["events"][1])
+        rows = telegram.sent[-1]["reply_markup"]["inline_keyboard"]
+        error_button = next(
+            button
+            for row in rows
+            for button in row
+            if button["text"] == "Show error details"
+        )
+
+        handlers.handle_update(
+            {
+                "callback_query": {
+                    "id": "show-error",
+                    "from": {"id": 123},
+                    "data": error_button["callback_data"],
+                    "message": {
+                        "message_id": telegram.sent[-1]["message_id"],
+                        "chat": {"id": 123, "type": "private"},
+                    },
+                }
+            }
+        )
+
+        details = "\n".join(message["text"] for message in telegram.sent[1:])
+        self.assertIn("Proposal error details", details)
+        self.assertIn("simulated DeepSeek failure", details)
+        self.assertIn("Save Alice", details)
+
+    def test_failed_revision_adds_error_details_to_unchanged_proposal(self) -> None:
+        handlers, telegram, registry = self.build()
+        handlers.handle_update(
+            {
+                "update_id": 112,
+                "message": {
+                    "text": "/add Alice started a new role",
+                    "from": {"id": 123},
+                    "chat": {"id": 123, "type": "private"},
+                },
+            }
+        )
+        original = registry.staged[0]["proposal"]
+        handlers.classifier.revision_error = True  # type: ignore[attr-defined]
+
+        handlers.handle_update(
+            {
+                "update_id": 113,
+                "message": {
+                    "text": "rewrite it differently",
+                    "from": {"id": 123},
+                    "chat": {"id": 123, "type": "private"},
+                },
+            }
+        )
+
+        staged = registry.staged[0]
+        self.assertIs(staged["proposal"], original)
+        self.assertEqual(
+            staged["error_report"]["exception_chain"][0]["message"],
+            "simulated revision rejection",
+        )
+        buttons = [
+            button
+            for row in telegram.edits[-1]["reply_markup"]["inline_keyboard"]
+            for button in row
+        ]
+        self.assertTrue(
+            any(button["text"] == "Show error details" for button in buttons)
+        )
 
     def test_reclassify_debug_returns_trace_and_stages_proposal(self) -> None:
         handlers, telegram, registry = self.build()
@@ -546,7 +938,7 @@ class HandlerTests(unittest.TestCase):
         )
         self.assertIn(
             "Approve",
-            telegram.edits[0]["reply_markup"]["inline_keyboard"][1][0]["text"],
+            telegram.edits[0]["reply_markup"]["inline_keyboard"][2][0]["text"],
         )
 
     def test_debug_proposal_automatically_traces_and_applies_steering(self) -> None:

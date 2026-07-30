@@ -6,8 +6,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .note_schema import NOTE_BULLET
 
-TargetType = Literal["friend", "project", "uncategorized"]
+
+TargetType = Literal["friend", "project", "follow_up", "uncategorized"]
 Category = Literal["note", "follow_up"]
 EditAction = Literal["append", "merge", "replace", "delete"]
 
@@ -20,14 +22,25 @@ class NoteEditOperation(BaseModel):
     match: str | None = Field(default=None, max_length=1000)
     content: str | None = Field(default=None, max_length=3000)
     source_quote: str = Field(min_length=1, max_length=1000)
-    reason: str = Field(min_length=1, max_length=300)
+    reason: str = Field(min_length=1, max_length=500)
 
-    @field_validator("section", "match", "content")
+    @field_validator("section", "match")
     @classmethod
     def strip_optional_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
         stripped = value.strip()
+        return stripped or None
+
+    @field_validator("content")
+    @classmethod
+    def normalize_operation_content(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        prefixes = (f"{NOTE_BULLET} ", "- ")
+        while stripped.startswith(prefixes):
+            stripped = stripped[2:].lstrip()
         return stripped or None
 
     @field_validator("source_quote", "reason")
@@ -60,7 +73,7 @@ class OperationProposalItem(BaseModel):
     follow_up_at: datetime | None
     birthday_mm_dd: str | None
     confidence: float = Field(ge=0, le=1)
-    reason: str = Field(min_length=1, max_length=300)
+    reason: str = Field(min_length=1, max_length=500)
 
     @model_validator(mode="after")
     def validate_operation_item(self) -> "OperationProposalItem":
@@ -69,7 +82,7 @@ class OperationProposalItem(BaseModel):
             self.category = "note"
             self.birthday_mm_dd = None
         elif not self.target_name.strip():
-            raise ValueError("target_name is required for a friend or project")
+            raise ValueError("target_name is required")
         if self.birthday_mm_dd:
             ProposalItem.valid_birthday(self.birthday_mm_dd)
             if self.target_type != "friend":
@@ -81,6 +94,10 @@ class OperationProposalItem(BaseModel):
                 raise ValueError("follow_up requires content and follow_up_at")
             if self.operations:
                 raise ValueError("follow_up cannot contain note operations")
+            if self.target_type != "follow_up":
+                raise ValueError("follow_up items must use standalone target_type=follow_up")
+        elif self.target_type == "follow_up":
+            raise ValueError("target_type=follow_up requires category=follow_up")
         elif not self.operations:
             raise ValueError("note items require at least one operation")
         return self
@@ -99,12 +116,12 @@ class ProposalItem(BaseModel):
     target_type: TargetType
     target_name: str = Field(max_length=120)
     category: Category
-    content: str = Field(min_length=1, max_length=3000)
+    content: str = Field(min_length=1, max_length=20_000)
     occurred_on: date | None
     follow_up_at: datetime | None
     birthday_mm_dd: str | None
     confidence: float = Field(ge=0, le=1)
-    reason: str = Field(min_length=1, max_length=300)
+    reason: str = Field(min_length=1, max_length=500)
 
     @field_validator("target_name", "content", "reason")
     @classmethod
@@ -129,13 +146,17 @@ class ProposalItem(BaseModel):
             self.category = "note"
             self.birthday_mm_dd = None
         elif not self.target_name:
-            raise ValueError("target_name is required for a friend or project")
+            raise ValueError("target_name is required")
         if self.birthday_mm_dd and self.target_type != "friend":
             raise ValueError("birthdays can only be assigned to friends")
         if self.follow_up_at is not None:
             self.category = "follow_up"
         elif self.category == "follow_up":
             raise ValueError("follow_up items require follow_up_at")
+        if self.category == "follow_up" and self.target_type != "follow_up":
+            raise ValueError("follow_up items must use standalone target_type=follow_up")
+        if self.target_type == "follow_up" and self.category != "follow_up":
+            raise ValueError("target_type=follow_up requires category=follow_up")
         return self
 
 
@@ -181,7 +202,7 @@ class SearchPlan(BaseModel):
     include_terms: list[str] = Field(default_factory=list, max_length=12)
     exclude_terms: list[str] = Field(default_factory=list, max_length=8)
     entity_names: list[str] = Field(default_factory=list, max_length=8)
-    target_types: list[TargetType] = Field(default_factory=list, max_length=3)
+    target_types: list[TargetType] = Field(default_factory=list, max_length=4)
     categories: list[Category] = Field(default_factory=list, max_length=6)
     limit: int = Field(default=20, ge=1, le=20)
     sort_by: Literal["relevance", "newest"] = "relevance"
@@ -197,3 +218,17 @@ class SearchAnswer(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     answer: str = Field(min_length=1, max_length=3500)
+
+
+class FriendNoteMigrationItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note_id: str = Field(min_length=1, max_length=120)
+    content: str = Field(min_length=1, max_length=20_000)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class FriendNoteMigrationProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[FriendNoteMigrationItem] = Field(max_length=8)

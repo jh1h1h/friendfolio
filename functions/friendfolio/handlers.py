@@ -10,6 +10,8 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .deepseek import DeepSeekClassifier
+from .errors import DeepSeekAPIError, DeepSeekResponseError, NoteOperationError
+from .migrations import MIGRATIONS
 from .models import NoteProposal, ProposalItem, SearchPlan
 from .store import FirestoreRegistry, safe_id, utc_now
 from .telegram_api import TelegramAPI
@@ -24,7 +26,7 @@ HELP_TEXT = """
 <code>/friend name</code> / <code>/project name</code> — create an entity
 <code>/friends</code> / <code>/projects</code> — list the registry
 <code>/show friend Alice</code> — show a friend or project
-<code>/next</code> — pending project follow-ups
+<code>/next</code> — pending follow-ups
 <code>/followups</code> — pending follow-ups
 <code>/done ID</code> — complete an item
 <code>/inbox</code> — uncategorized notes
@@ -32,6 +34,7 @@ HELP_TEXT = """
 <code>/birthdays</code> — saved birthdays
 <code>/search words</code> — search note text
 <code>/confidence [0-100]</code> — view or set the confidence threshold
+<code>/migrate [ID]</code> — preview a friend-note schema migration
 <code>/whoami</code> — show your Telegram user ID
 """.strip()
 
@@ -52,6 +55,59 @@ def _context_value(value: Any) -> Any:
 def _debug_argument(value: str) -> tuple[bool, str]:
     first, separator, remainder = value.partition(" ")
     return (True, remainder.strip()) if first.casefold() == "-debug" else (False, value)
+
+
+def _proposal_failure_reason(error: Exception) -> str:
+    if isinstance(error, NoteOperationError):
+        if error.match_count == 0:
+            return "The suggested change did not exactly match the saved note."
+        if error.match_count is not None and error.match_count > 1:
+            return (
+                "The suggested change matched more than one place, so it could not "
+                "be applied safely."
+            )
+        return "The suggested note change could not be applied safely."
+    if isinstance(error, DeepSeekAPIError):
+        return "DeepSeek could not be reached."
+    if isinstance(error, DeepSeekResponseError):
+        return "DeepSeek returned an invalid response."
+    return "The proposal could not be prepared."
+
+
+def _proposal_failure_message(error: Exception) -> str:
+    return (
+        f"{_proposal_failure_reason(error)} Nothing was changed; "
+        "save the original text to the inbox?"
+    )
+
+
+def _proposal_error_report(
+    error: Exception, trace: list[dict[str, Any]]
+) -> dict[str, Any]:
+    chain = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(
+            {
+                "type": type(current).__name__,
+                "message": str(current),
+            }
+        )
+        current = current.__cause__ or current.__context__
+    return {
+        "summary": _proposal_failure_reason(error),
+        "exception_chain": chain,
+        "events": trace,
+    }
+
+
+def _render_proposal_error_report(report: dict[str, Any]) -> str:
+    return (
+        "Proposal error details\n\n"
+        + json.dumps(report, ensure_ascii=False, indent=2, default=str)
+    )
 
 
 def _is_context_note(note: dict[str, Any], target_type: str) -> bool:
@@ -155,21 +211,47 @@ def _proposal_preview(
     return text if len(text) <= 4000 else text[:3999] + "…"
 
 
-def _approval_keyboard(token: str) -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
+def _approval_keyboard(
+    token: str,
+    proposal: NoteProposal,
+    show_error_details: bool = False,
+) -> dict[str, Any]:
+    rows = [
+        [
+            {
+                "text": "View full proposed note",
+                "callback_data": f"proposal:view:{token}",
+            }
+        ]
+    ]
+    if show_error_details:
+        rows.append(
             [
                 {
-                    "text": "View full proposed note",
-                    "callback_data": f"proposal:view:{token}",
+                    "text": "Show error details",
+                    "callback_data": f"proposal:error:{token}",
                 }
-            ],
-            [
-                {"text": "Approve", "callback_data": f"proposal:approve:{token}"},
-                {"text": "Cancel", "callback_data": f"proposal:cancel:{token}"},
             ]
+        )
+    for index, item in enumerate(proposal.items):
+        if item.category != "note":
+            continue
+        target = item.target_name or "Inbox"
+        rows.append(
+            [
+                {
+                    "text": f"Manually edit {target}"[:64],
+                    "callback_data": f"proposal:manual:{token}.{index}",
+                }
+            ]
+        )
+    rows.append(
+        [
+            {"text": "Approve", "callback_data": f"proposal:approve:{token}"},
+            {"text": "Cancel", "callback_data": f"proposal:cancel:{token}"},
         ]
-    }
+    )
+    return {"inline_keyboard": rows}
 
 
 def _followup_keyboard(note_id: str) -> dict[str, Any]:
@@ -181,6 +263,74 @@ def _followup_keyboard(note_id: str) -> dict[str, Any]:
             ]
         ]
     }
+
+
+def _migration_keyboard(token: str, index: int, total: int) -> dict[str, Any]:
+    navigation = []
+    if index > 0:
+        navigation.append(
+            {
+                "text": "← Previous",
+                "callback_data": f"migration:page:{token}.{index - 1}",
+            }
+        )
+    if index + 1 < total:
+        navigation.append(
+            {
+                "text": "Next →",
+                "callback_data": f"migration:page:{token}.{index + 1}",
+            }
+        )
+    rows = [navigation] if navigation else []
+    rows.append(
+        [
+            {
+                "text": "View full new note",
+                "callback_data": f"migration:content:{token}.{index}",
+            }
+        ]
+    )
+    rows.append(
+        [
+            {
+                "text": "Apply migration",
+                "callback_data": f"migration:apply:{token}",
+            },
+            {
+                "text": "Cancel",
+                "callback_data": f"migration:cancel:{token}",
+            },
+        ]
+    )
+    return {
+        "inline_keyboard": rows
+    }
+
+
+def _migration_preview(action: dict[str, Any], index: int) -> str:
+    changes = action.get("changes", [])
+    if not changes:
+        return "This migration has no proposed changes."
+    index = max(0, min(index, len(changes) - 1))
+    change = changes[index]
+    delta = _content_delta(
+        str(change["old_content"]), str(change["new_content"])
+    )
+    if len(delta) > 3000:
+        delta = delta[:3000] + "\n… delta preview truncated"
+    lines = [
+        f"<b>Migration preview · {index + 1}/{len(changes)}</b>",
+        f"<b>{html.escape(str(change['target_name']))}</b>",
+        f"<pre>{html.escape(delta)}</pre>",
+        html.escape(str(change.get("reason", ""))),
+    ]
+    remaining = int(action.get("remaining_count", 0))
+    if remaining:
+        lines.append(
+            f"{remaining} additional note(s) remain for a later migration batch."
+        )
+    lines.append("Nothing has been changed yet.")
+    return "\n\n".join(lines)
 
 
 class BotHandlers:
@@ -258,18 +408,99 @@ class BotHandlers:
             "/birthdays": lambda: self._birthdays(chat_id, user_id),
             "/search": lambda: self._search(chat_id, user_id, body),
             "/confidence": lambda: self._confidence(chat_id, user_id, body),
+            "/migrate": lambda: self._migrate(chat_id, user_id, body),
         }
         handler = commands.get(command)
         if handler:
             LOGGER.warning("routing_command command=%s user_id=%s chat_id=%s", command, user_id, chat_id)
             handler()
             return
-        if text and not text.startswith("/") and self._revise_pending_proposal(
-            chat_id, user_id, text
-        ):
-            return
+        if text and not text.startswith("/"):
+            if self._consume_manual_edit(chat_id, user_id, text):
+                return
+            if self._revise_pending_proposal(chat_id, user_id, text):
+                return
         else:
             self.telegram.send(chat_id, "Unknown command. Use /help.")
+
+    def _migrate(self, chat_id: int, user_id: int, migration_id: str) -> None:
+        if not migration_id:
+            lines = ["<b>Available migrations</b>"]
+            for definition in MIGRATIONS.values():
+                lines.append(
+                    f"<code>/migrate {html.escape(definition.migration_id)}</code> — "
+                    f"{html.escape(definition.description)}"
+                )
+            self.telegram.send(chat_id, "\n".join(lines), parse_mode="HTML")
+            return
+        try:
+            candidates, remaining = self.registry.migration_candidates(
+                user_id,
+                migration_id,
+            )
+        except ValueError:
+            self.telegram.send(
+                chat_id,
+                "Unknown migration. Use /migrate to list available migrations.",
+            )
+            return
+        if not candidates:
+            self.telegram.send(chat_id, "Everything is already up to date.")
+            return
+        try:
+            proposal = self.classifier.migrate_friend_notes(
+                [
+                    {
+                        "note_id": str(candidate["id"]),
+                        "friend_name": str(candidate["target_name"]),
+                        "content": str(candidate["content"]),
+                    }
+                    for candidate in candidates
+                ],
+                sorted(
+                    {
+                        section
+                        for candidate in candidates
+                        for section in candidate["new_sections"]
+                    }
+                ),
+            )
+        except Exception as exc:
+            LOGGER.exception("DeepSeek migration preview failed")
+            self.telegram.send(
+                chat_id,
+                f"{_proposal_failure_reason(exc)} No migration was staged.",
+            )
+            return
+        rewritten = {item.note_id: item for item in proposal.items}
+        changes = [
+            {
+                "id": str(candidate["id"]),
+                "expected_hash": str(candidate["expected_hash"]),
+                "target_name": str(candidate["target_name"]),
+                "old_content": str(candidate["content"]),
+                "new_content": rewritten[str(candidate["id"])].content,
+                "reason": rewritten[str(candidate["id"])].reason,
+            }
+            for candidate in candidates
+        ]
+        token, _ = self.registry.stage_migration(
+            user_id,
+            migration_id,
+            changes,
+            remaining,
+            self.pending_expiry_hours,
+        )
+        action = self.registry.get_migration_action(user_id, token)
+        if action is None:
+            self.telegram.send(chat_id, "The migration preview could not be stored.")
+            return
+        self.telegram.send(
+            chat_id,
+            _migration_preview(action, 0),
+            parse_mode="HTML",
+            reply_markup=_migration_keyboard(token, 0, len(changes)),
+        )
 
     def _create_entity(
         self, chat_id: int, user_id: int, target_type: str, name: str
@@ -434,17 +665,20 @@ class BotHandlers:
             )
             return
         fallback = False
-        trace: list[dict[str, Any]] | None = [] if debug else None
+        trace: list[dict[str, Any]] = []
+        error_report: dict[str, Any] | None = None
         try:
             proposal = self._classify(user_id, note, trace)
         except Exception as exc:
             LOGGER.exception("DeepSeek classification failed")
             if debug:
-                self._send_debug_trace(chat_id, trace or [], exc)
+                self._send_debug_trace(chat_id, trace, exc)
                 return
             fallback = True
+            error_report = _proposal_error_report(exc, trace)
+            failure_message = _proposal_failure_message(exc)
             proposal = NoteProposal(
-                summary="DeepSeek was unavailable; save this to the inbox?",
+                summary=failure_message,
                 items=[
                     ProposalItem(
                         target_type="uncategorized",
@@ -455,12 +689,12 @@ class BotHandlers:
                         follow_up_at=None,
                         birthday_mm_dd=None,
                         confidence=0,
-                        reason="The model request failed, so no category was guessed.",
+                        reason="The proposal failed, so no category was guessed.",
                     )
                 ],
             )
         if debug:
-            self._send_debug_trace(chat_id, trace or [])
+            self._send_debug_trace(chat_id, trace)
         token = safe_id(user_id, update_id, "proposal")
         token, status = self.registry.stage_pending(
             user_id,
@@ -469,13 +703,14 @@ class BotHandlers:
             self.pending_expiry_hours,
             token=token,
             debug_mode=debug,
+            error_report=error_report,
         )
         if status not in {"pending"}:
             self.telegram.send(
                 chat_id, f"This update was already processed ({status})."
             )
             return
-        prefix = "DeepSeek categorization failed. " if fallback else ""
+        prefix = "Proposal preparation failed. " if fallback else ""
         previous_contents = self._proposal_previous_contents(user_id, proposal)
         sent = self.telegram.send(
             chat_id,
@@ -484,7 +719,9 @@ class BotHandlers:
                 proposal, self.timezone_name, previous_contents
             ),
             parse_mode="HTML",
-            reply_markup=_approval_keyboard(token),
+            reply_markup=_approval_keyboard(
+                token, proposal, show_error_details=error_report is not None
+            ),
         )
         result = sent.get("result") if isinstance(sent, dict) else None
         if isinstance(result, dict):
@@ -536,7 +773,15 @@ class BotHandlers:
             len(current_proposal.items),
             pending.get("message_id"),
         )
-        trace: list[dict[str, Any]] | None = [] if debug else None
+        token = str(pending.get("id", ""))
+        if not token:
+            LOGGER.warning(
+                "revise_pending_missing_token user_id=%s chat_id=%s",
+                user_id,
+                chat_id,
+            )
+            return False
+        trace: list[dict[str, Any]] = []
         try:
             revised = self.classifier.revise(
                 instruction,
@@ -544,16 +789,41 @@ class BotHandlers:
                 self.registry.list_entity_names(user_id, "friend"),
                 self.registry.list_entity_names(user_id, "project"),
                 _now_in_timezone(self.timezone_name),
-                trace=trace.append if trace is not None else None,
+                trace=trace.append,
             )
         except Exception as exc:
             LOGGER.exception("DeepSeek revision failed")
             if debug:
-                self._send_debug_trace(chat_id, trace or [], exc)
-            self.telegram.send(
-                chat_id,
-                "I could not revise that proposal. Please try again or press Cancel.",
-            )
+                self._send_debug_trace(chat_id, trace, exc)
+            else:
+                report = _proposal_error_report(exc, trace)
+                self.registry.set_pending_error_report(user_id, token, report)
+                message = (
+                    f"{_proposal_failure_reason(exc)} The proposal is unchanged. "
+                    "Review the error details, try again, or press Cancel."
+                )
+                message_id = pending.get("message_id")
+                if isinstance(message_id, int):
+                    self.telegram.edit(
+                        chat_id,
+                        message_id,
+                        message,
+                        reply_markup=_approval_keyboard(
+                            token,
+                            current_proposal,
+                            show_error_details=True,
+                        ),
+                    )
+                else:
+                    self.telegram.send(
+                        chat_id,
+                        message,
+                        reply_markup=_approval_keyboard(
+                            token,
+                            current_proposal,
+                            show_error_details=True,
+                        ),
+                    )
             return True
         LOGGER.warning(
             "revise_pending_classified token=%s revised_items=%s summary=%s",
@@ -562,10 +832,6 @@ class BotHandlers:
             revised.summary,
         )
 
-        token = str(pending.get("id", ""))
-        if not token:
-            LOGGER.warning("revise_pending_missing_token user_id=%s chat_id=%s", user_id, chat_id)
-            return False
         status = self.registry.revise_pending(user_id, token, revised, instruction)
         LOGGER.warning(
             "revise_pending_firestore_result token=%s status=%s",
@@ -595,7 +861,7 @@ class BotHandlers:
                 message_id,
                 preview,
                 parse_mode="HTML",
-                reply_markup=_approval_keyboard(token),
+                reply_markup=_approval_keyboard(token, revised),
             )
         else:
             LOGGER.warning(
@@ -607,7 +873,7 @@ class BotHandlers:
                 chat_id,
                 preview,
                 parse_mode="HTML",
-                reply_markup=_approval_keyboard(token),
+                reply_markup=_approval_keyboard(token, revised),
             )
             result = sent.get("result") if isinstance(sent, dict) else None
             if isinstance(result, dict):
@@ -621,6 +887,73 @@ class BotHandlers:
                     self.registry.set_pending_message(user_id, token, chat_id, message_id)
         if debug:
             self._send_debug_trace(chat_id, trace or [])
+        return True
+
+    def _consume_manual_edit(
+        self, chat_id: int, user_id: int, replacement: str
+    ) -> bool:
+        pending = self.registry.latest_pending_action(user_id)
+        if not pending or pending.get("manual_edit_item_index") is None:
+            return False
+        token = str(pending["id"])
+        index = int(pending["manual_edit_item_index"])
+        try:
+            proposal = NoteProposal.model_validate(pending["proposal"])
+        except Exception:
+            LOGGER.exception("Stored pending proposal is invalid during manual edit")
+            self.telegram.send(
+                chat_id, "That proposal can no longer be edited. Please cancel it."
+            )
+            return True
+        if not replacement.strip():
+            self.telegram.send(chat_id, "The replacement note cannot be empty.")
+            return True
+        if index < 0 or index >= len(proposal.items):
+            self.telegram.send(chat_id, "That manual-edit target is no longer valid.")
+            return True
+        payload = proposal.model_dump(mode="json")
+        payload["items"][index]["content"] = replacement
+        payload["summary"] = (
+            f"Manually replace {proposal.items[index].target_name or 'Inbox'}’s note"
+        )
+        revised = NoteProposal.model_validate(payload)
+        status = self.registry.replace_pending_item(
+            user_id, token, revised, index
+        )
+        if status != "pending":
+            self.telegram.send(
+                chat_id, f"This proposal is {status}; it was not changed."
+            )
+            return True
+        preview = (
+            "<b>Confirm manual replacement</b>\n\n"
+            + _proposal_preview(
+                revised,
+                self.timezone_name,
+                self._proposal_previous_contents(user_id, revised),
+            )
+        )
+        message_id = pending.get("message_id")
+        if isinstance(message_id, int):
+            self.telegram.edit(
+                chat_id,
+                message_id,
+                preview,
+                parse_mode="HTML",
+                reply_markup=_approval_keyboard(token, revised),
+            )
+        else:
+            sent = self.telegram.send(
+                chat_id,
+                preview,
+                parse_mode="HTML",
+                reply_markup=_approval_keyboard(token, revised),
+            )
+            result = sent.get("result") if isinstance(sent, dict) else None
+            if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+                self.registry.set_pending_message(
+                    user_id, token, chat_id, result["message_id"]
+                )
         return True
 
     def _list_entities(self, chat_id: int, user_id: int, target_type: str) -> None:
@@ -750,7 +1083,10 @@ class BotHandlers:
             if debug:
                 self._send_debug_trace(chat_id, trace or [], exc)
                 return
-            self.telegram.send(chat_id, "DeepSeek failed; the inbox note is unchanged.")
+            self.telegram.send(
+                chat_id,
+                f"{_proposal_failure_reason(exc)} The inbox note is unchanged.",
+            )
             return
         if debug:
             self._send_debug_trace(chat_id, trace or [])
@@ -777,7 +1113,7 @@ class BotHandlers:
                 self._proposal_previous_contents(user_id, proposal),
             ),
             parse_mode="HTML",
-            reply_markup=_approval_keyboard(token),
+            reply_markup=_approval_keyboard(token, proposal),
         )
         result = sent.get("result") if isinstance(sent, dict) else None
         if isinstance(result, dict):
@@ -788,9 +1124,9 @@ class BotHandlers:
     def _followups(self, chat_id: int, user_id: int) -> None:
         rows = self.registry.pending_followups(user_id)
         if not rows:
-            self.telegram.send(chat_id, "No pending follow-ups or next actions.")
+            self.telegram.send(chat_id, "No pending follow-ups.")
             return
-        lines = ["<b>Pending follow-ups and next actions</b>"]
+        lines = ["<b>Pending follow-ups</b>"]
         for row in rows:
             lines.append(
                 f"\n<b>#{_display_id(row['id'])}</b> · "
@@ -802,18 +1138,7 @@ class BotHandlers:
         self.telegram.send(chat_id, "\n".join(lines), parse_mode="HTML")
 
     def _next(self, chat_id: int, user_id: int) -> None:
-        rows = self.registry.project_next_actions(user_id)
-        if not rows:
-            self.telegram.send(chat_id, "No pending project follow-ups.")
-            return
-        lines = ["<b>Project follow-ups</b>"]
-        for row in rows:
-            lines.append(
-                f"\n<b>#{_display_id(row['id'])}</b> · "
-                f"{html.escape(str(row.get('target_name', 'Project')))}\n"
-                f"{html.escape(_short(str(row.get('content', ''))))}"
-            )
-        self.telegram.send(chat_id, "\n".join(lines), parse_mode="HTML")
+        self._followups(chat_id, user_id)
 
     def _done(self, chat_id: int, user_id: int, value: str) -> None:
         note_id = self.registry.resolve_note_id(user_id, value) if value else None
@@ -926,7 +1251,10 @@ class BotHandlers:
         message = query.get("message", {})
         chat_id = int(message.get("chat", {}).get("id", 0))
         message_id = int(message.get("message_id", 0))
-        if user_id not in self.allowed_user_ids:
+        if (
+            user_id not in self.allowed_user_ids
+            or message.get("chat", {}).get("type") != "private"
+        ):
             self.telegram.answer_callback(callback_id, "This bot is private.")
             return
         self.telegram.answer_callback(callback_id)
@@ -936,6 +1264,53 @@ class BotHandlers:
             return
         kind, action, value = parts
         if kind == "proposal":
+            if action == "error":
+                pending = self.registry.get_pending_action(user_id, value)
+                if pending is None:
+                    self.telegram.send(chat_id, "This proposal no longer exists.")
+                    return
+                report = pending.get("error_report")
+                if not isinstance(report, dict):
+                    self.telegram.send(
+                        chat_id, "No detailed error report is available."
+                    )
+                    return
+                for chunk in _split_text(_render_proposal_error_report(report)):
+                    self.telegram.send(chat_id, chunk)
+                return
+            if action == "manual":
+                token, separator, raw_index = value.rpartition(".")
+                if not separator or not raw_index.isdigit():
+                    self.telegram.edit(chat_id, message_id, "Invalid manual-edit action.")
+                    return
+                pending = self.registry.get_pending_action(user_id, token)
+                if pending is None:
+                    self.telegram.edit(chat_id, message_id, "This proposal no longer exists.")
+                    return
+                proposal = NoteProposal.model_validate(pending["proposal"])
+                index = int(raw_index)
+                if index < 0 or index >= len(proposal.items):
+                    self.telegram.edit(chat_id, message_id, "Invalid manual-edit target.")
+                    return
+                status = self.registry.begin_pending_manual_edit(
+                    user_id, token, index
+                )
+                if status != "pending":
+                    self.telegram.edit(
+                        chat_id,
+                        message_id,
+                        f"This proposal is {status}; it cannot be edited.",
+                    )
+                    return
+                target = proposal.items[index].target_name or "Inbox"
+                self.telegram.edit(
+                    chat_id,
+                    message_id,
+                    f"Manual edit for {target}’s complete note.\n\n"
+                    "Send the full replacement note in your next message. "
+                    "It will not be saved until you review and press Approve.",
+                )
+                return
             if action == "view":
                 pending = self.registry.get_pending_action(user_id, value)
                 if pending is None:
@@ -971,6 +1346,8 @@ class BotHandlers:
                         target_name = html.escape(saved_note["target_name"])
                         if saved_note.get("record_type") == "history":
                             label = f"{target_name}’s history note"
+                        elif saved_note.get("record_type") == "follow_up":
+                            label = f"follow-up: {target_name}"
                         elif saved_note["target_type"] == "uncategorized":
                             label = "inbox note"
                         else:
@@ -998,6 +1375,66 @@ class BotHandlers:
                     return
             self.telegram.edit(
                 chat_id, message_id, f"This proposal is {status}; it was not changed."
+            )
+            return
+        if kind == "migration":
+            if action in {"page", "content", "full"}:
+                token, separator, raw_index = value.rpartition(".")
+                if not separator or not raw_index.isdigit():
+                    self.telegram.edit(chat_id, message_id, "Invalid migration page.")
+                    return
+                migration = self.registry.get_migration_action(user_id, token)
+                if migration is None:
+                    self.telegram.edit(
+                        chat_id, message_id, "This migration no longer exists."
+                    )
+                    return
+                changes = migration.get("changes", [])
+                index = min(int(raw_index), max(0, len(changes) - 1))
+                if action in {"content", "full"}:
+                    change = changes[index]
+                    full_note = (
+                        f"Proposed new note {index + 1}/{len(changes)} · "
+                        f"{change['target_name']}\n\n"
+                        f"{change['new_content']}"
+                    )
+                    for chunk in _split_text(full_note):
+                        self.telegram.send(chat_id, chunk)
+                    return
+                self.telegram.edit(
+                    chat_id,
+                    message_id,
+                    _migration_preview(migration, index),
+                    parse_mode="HTML",
+                    reply_markup=_migration_keyboard(token, index, len(changes)),
+                )
+                return
+            if action not in {"apply", "cancel"}:
+                self.telegram.edit(chat_id, message_id, "Invalid migration action.")
+                return
+            status, result = self.registry.decide_migration(
+                user_id,
+                value,
+                apply=action == "apply",
+            )
+            if status == "applied":
+                self.telegram.edit(
+                    chat_id,
+                    message_id,
+                    f"Migration applied: {result.get('updated', 0)} updated, "
+                    f"{result.get('skipped', 0)} skipped because they changed "
+                    "after the preview.",
+                )
+                return
+            if status == "cancelled":
+                self.telegram.edit(
+                    chat_id, message_id, "Migration cancelled. Nothing was changed."
+                )
+                return
+            self.telegram.edit(
+                chat_id,
+                message_id,
+                f"This migration is {status}; it was not changed.",
             )
             return
         if kind == "followup":

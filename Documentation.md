@@ -31,11 +31,12 @@ Bot commands may include the bot username, such as `/help@FriendfolioBot`. The u
 | `/inbox` | `_inbox()` | Shows up to 20 active notes whose `target_type` is `uncategorized`, oldest first, with eight-character display IDs. |
 | `/reclassify [-debug] <ID> [context]` | `_reclassify()` | Retries an inbox note, optionally enabling traces for classification and later steering. |
 | `/followups` | `_followups()` | Lists up to 30 notes with `follow_up_status: pending`, ordered by follow-up time. Items without a date appear after dated items. |
-| `/next` | `_next()` | Filters pending follow-ups to project targets, returning up to 30. |
+| `/next` | `_next()` | Alias for `/followups`; shows the same standalone pending-reminder list. |
 | `/done <ID>` | `_done()` | Resolves a unique note-ID prefix and changes its follow-up status from `pending` to `done`, recording `completed_at`. |
 | `/birthdays` | `_birthdays()` | Reads friends with `birthday_mm_dd`, sorts them by month/day and name, and displays the saved dates. |
 | `/search <words>` | `_search()` | Uses DeepSeek to plan the search, ranks matching notes locally, then asks DeepSeek to synthesize a grounded answer from those matches. Falls back to raw results if answer generation fails. |
 | `/confidence [0-100]` | `_confidence()` | Shows the current per-user threshold, or stores a new percentage. Proposals below it are sent to the uncategorized inbox. |
+| `/migrate [ID]` | `_migrate()` | Lists migrations or asks DeepSeek to prepare a read-only, paginated friend-note migration preview with Apply and Cancel buttons. |
 
 Unknown commands receive `Unknown command. Use /help.` Commands with missing or invalid arguments receive a usage message and do not write anything.
 
@@ -43,6 +44,31 @@ Debug mode belongs to the pending proposal: `-debug` must be the first `/add` or
 argument. It emits raw prompts, HTTP responses, and captured errors without including the API
 authorization header. The proposal is still staged normally. Every later steering message
 automatically emits revision traces and updates the staged proposal and Telegram preview.
+
+### Manual full-note replacement
+
+Every staged ordinary note has a `proposal:manual:{token}.{item-index}` button. Pressing it stores
+`manual_edit_item_index` on the pending action and removes the approval keyboard while the bot waits
+for input. The next non-command text message becomes that proposal item's complete `content`;
+DeepSeek is not called and other proposal items remain unchanged.
+
+The replacement clears the waiting state and edits the proposal message to show **Confirm manual
+replacement**, an exact delta against the saved database note, and a fresh approval keyboard.
+Firestore remains unchanged until **Approve** is pressed. The waiting state is stored in Firestore,
+so it survives function restarts and Telegram webhook retries.
+
+### Proposal error details
+
+Non-debug `/add` requests still capture the internal trace. When initial classification or a
+steering revision fails, `_proposal_error_report()` stores a structured `error_report` on the
+pending action. It contains the typed user-facing summary, every exception and chained cause, and
+the ordered trace events. Trace events include prompts, raw DeepSeek responses, retry errors, and
+deterministic operation-validation failures, allowing the report to identify the proposed edit,
+rejected match, and exact rejection reason.
+
+The approval keyboard then includes `proposal:error:{token}`. Only the allowed user in a private
+chat can open it, and Telegram sends long reports in multiple messages. Authorization headers are
+never part of DeepSeek traces. A failed steering revision leaves the preceding proposal unchanged.
 
 ## `/add` classification and approval
 
@@ -64,6 +90,8 @@ automatically emits revision traces and updates the staged proposal and Telegram
 6. Python validates every operation and applies it deterministically. `merge`, `replace`, and
    `delete` must identify exactly one existing line or multi-line block. The resulting full notes
    are validated as a `NoteProposal`; one input can affect several entities.
+   Failures are typed as API, invalid-response, or unsafe-operation errors so the Telegram response
+   can distinguish an unavailable service from a missing or ambiguous note match.
 7. A deterministic proposal token is calculated from the Telegram user ID and update ID. This prevents a retried Telegram update from creating duplicate proposals.
 8. The proposal is stored in `pending_actions/{token}` with `status: pending` and an expiry time, normally 24 hours.
 9. The bot shows the proposed target, category, changed content lines, dates, confidence, and reason.
@@ -95,11 +123,13 @@ Dislikes:
 Relationship with family:
 ```
 
-Within a section, Python normally stores facts as bullets. `append` creates a new bullet. `merge`
-groups a related fact into one existing topic bullet while requiring the complete replacement to
+Within a section, Python stores fact rows with a `•` bullet. `append` creates a new `•` row. `merge`
+groups a related fact into one existing topic row while requiring the complete replacement to
 preserve both old and new details. `replace` is reserved for corrections or state transitions.
 `delete` requires an explicit removal or false-information instruction and removes only one
 uniquely matched line or multi-line block. Every operation carries a verbatim `source_quote`.
+DeepSeek returns operation content without a bullet; Python also removes accidental leading `•`
+or `-` markers before adding exactly one `•`.
 
 Project and uncategorized notes remain concise and do not use the friend-profile sections. On
 friend or project approval, the original `/add` text is appended to that entity's history with a
@@ -109,10 +139,11 @@ fields. If DeepSeek omits an expected section, the bot does not rebuild or other
 content. It places a warning before the normal proposal so the user can review, cancel, and retry
 the same `/add` command when necessary. Section detection is case-insensitive.
 
-Only explicitly scheduled reminders use the separate `follow_up` category. Follow-ups do not
-replace the friend or project current note. Each follow-up requires a specific `follow_up_at`
-date/time, which drives reminder notifications. `/followups` shows all pending follow-ups, while
-`/next` retains a project-only follow-up view.
+Only explicitly scheduled reminders use the separate `follow_up` category and
+`target_type: follow_up`. New follow-ups have no friend/project `target_id`, do not modify an
+entity's current note, and do not create friend/project history. A reminder that mentions a person
+is still standalone. Each requires a specific `follow_up_at`, which drives notifications.
+`/followups` and `/next` show the same pending list.
 
 If DeepSeek fails, the bot creates a proposed uncategorized inbox note instead. This fallback still requires approval.
 The confidence threshold defaults to 65%. DeepSeek is instructed to use it, and the bot also
@@ -154,6 +185,27 @@ Daily reminder messages can contain these callbacks:
 
 Callback senders are checked against the same allowlist as commands. Telegram's original reminder message is edited to show the outcome.
 
+## Friend-note schema migrations
+
+The current friend-note headings and `FRIEND_NOTE_SCHEMA_VERSION` live in `note_schema.py`.
+Newly approved friend notes receive the current version. Existing current notes are upgraded with
+`/migrate friend-notes-v1`; history, follow-ups, projects, archived notes, and already-versioned
+notes are excluded.
+
+The command loads a batch of at most eight eligible notes and asks DeepSeek for complete migrated
+notes. The migration prompt requires every existing fact to be retained, moves facts that clearly
+belong in newly introduced sections, leaves unsupported fields blank, and forbids inference and
+broad paraphrasing. Python rejects responses that omit a note or do not contain every required
+section exactly once.
+
+The resulting complete notes and their original content hashes are staged in `migration_actions`.
+Telegram displays one line delta at a time with Previous and Next buttons and an `x/total` counter.
+**View full new note** sends the selected friend's complete proposed note in one or more messages.
+Applying uses one Firestore transaction: it rereads every note, skips notes whose content changed
+after preview, saves prior content in `migration_backups`, writes the reviewed DeepSeek result, and
+records the new schema version. The operation is idempotent. If more than eight notes qualify,
+Telegram reports the remainder and the command can be run again for the next batch.
+
 ## Scheduled notifications
 
 The `daily_reminders` Firebase function runs every day at 09:00 in `Asia/Singapore`. For every allowed user it:
@@ -175,9 +227,10 @@ users/{telegram-user-id}
   notification_log/{notification-id}
 ```
 
-Friend and project documents in `notes` use `record_type: note`, `history`, or `follow_up`. Each
-entity has one mutable current note, any number of timestamped history entries, and any number of
-independently completable follow-ups. Older friend records using `record_type: summary` remain
+Friend and project documents in `notes` use `record_type: note` or `history`. Standalone reminders
+use `target_type: follow_up`, `record_type: follow_up`, and `target_id: null`. Older follow-ups that
+were tagged to friends or projects remain readable, notifiable, snoozable, and completable, but new
+proposals cannot create that legacy shape. Older friend records using `record_type: summary` remain
 readable and are converted to `note` when next updated.
 
 - Friend and project IDs are hashes of normalized names, so capitalization and repeated spaces do not create separate entities.

@@ -17,7 +17,7 @@ COMMANDS = [
     {"command": "friends", "description": "List friends"},
     {"command": "projects", "description": "List projects"},
     {"command": "show", "description": "Show a friend or project"},
-    {"command": "next", "description": "Show pending project follow-ups"},
+    {"command": "next", "description": "Show pending follow-ups"},
     {"command": "followups", "description": "Show pending follow-ups"},
     {"command": "done", "description": "Complete a follow-up"},
     {"command": "inbox", "description": "Show uncategorized notes"},
@@ -25,6 +25,7 @@ COMMANDS = [
     {"command": "birthdays", "description": "Show saved birthdays"},
     {"command": "search", "description": "Search notes"},
     {"command": "confidence", "description": "View or set confidence threshold"},
+    {"command": "migrate", "description": "Preview a friend-note schema migration"},
 ]
 
 

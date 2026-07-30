@@ -23,7 +23,7 @@ Firebase Hosting is not needed; it hosts websites, whereas Telegram calls the fu
 - Each friend and project has an append-only timestamped history and one mutable current note.
 - Friend notes use a structured profile template; project notes remain concise and free-form.
 - Durable time references: relative dates and ages are anchored to explicit calendar dates.
-- Project notes and scheduled project follow-ups.
+- Standalone scheduled follow-ups, separate from friends and projects.
 - Multi-stage DeepSeek `/add`: resolve related entities, load their saved context, draft operations,
   verify them, then show the resulting update with explicit **Approve**/**Cancel** buttons.
 - DeepSeek proposes append/merge/replace/delete operations instead of rewriting whole notes; a
@@ -175,7 +175,7 @@ firebase deploy --only functions
 | `/friends`, `/projects` | List entities and note counts |
 | `/show friend <name>` | Show one friend's recent notes |
 | `/show project <name>` | Show one project's recent notes |
-| `/next` | Show pending project follow-ups |
+| `/next` | Show pending follow-ups (alias of `/followups`) |
 | `/followups` | Show all pending follow-ups |
 | `/done <ID>` | Complete an item using its displayed eight-character ID |
 | `/inbox` | Show uncategorized notes |
@@ -183,10 +183,30 @@ firebase deploy --only functions
 | `/birthdays` | Show birthdays |
 | `/search <words>` | Search notes, then have DeepSeek synthesize a grounded answer |
 | `/confidence [0-100]` | View or set the per-user classification confidence threshold |
+| `/migrate [ID]` | List or preview an approved friend-note schema migration |
 | `/whoami` | Show your Telegram user ID |
+
+`/migrate friend-notes-v1` asks DeepSeek to reorganize each current friend note into the latest
+sections. Existing facts that clearly belong in a newly added field are moved there instead of
+being duplicated; unsupported fields remain blank. Telegram shows one exact before/after delta at
+a time with Previous/Next buttons and an `x/total` counter. **View full new note** sends the
+selected complete proposed note. Nothing changes until **Apply migration** is pressed. Each note
+is checked again before writing, so a note edited after the preview is
+skipped. Applied notes receive `schema_version: 1`; old content is retained in
+`migration_backups`. Re-running the command is safe and processes only unmigrated notes.
 
 After `/add`, plain text revises the pending proposal. If the proposal began with `/add -debug`,
 all later steering automatically emits raw revision traces while continuing to update the proposal.
+Each ordinary note also has a **Manually edit _name_** button. After pressing it, the next
+plain-text message replaces that staged note in full without calling DeepSeek. The bot shows the
+replacement delta and still requires **Approve** before Firestore changes. Multi-target proposals
+provide a separate manual-edit button for each note.
+
+If initial proposal generation or a later steering revision fails, the pending proposal shows
+**Show error details**. It sends a chunked JSON report containing the user-facing failure category,
+the full exception/cause chain, prompts, raw DeepSeek responses, retries, and exact validation or
+operation errors. This captures rejected operations and their match text while keeping the report
+behind the existing private-chat and allowed-user checks.
 
 ## Firestore structure
 

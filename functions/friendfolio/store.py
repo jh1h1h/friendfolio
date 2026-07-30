@@ -9,11 +9,14 @@ from zoneinfo import ZoneInfo
 
 from firebase_admin import firestore
 
+from .migrations import MIGRATIONS, migrate_friend_note, missing_friend_note_sections
 from .models import NoteProposal, SearchPlan
+from .note_schema import FRIEND_NOTE_SCHEMA_VERSION
 
 
 UTC = timezone.utc
 DEFAULT_CONFIDENCE_THRESHOLD = 0.65
+MIGRATION_BATCH_SIZE = 8
 
 
 def utc_now() -> datetime:
@@ -190,6 +193,7 @@ class FirestoreRegistry:
         token: str | None = None,
         source_note_id: str | None = None,
         debug_mode: bool = False,
+        error_report: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         token = token or uuid.uuid4().hex
         ref = self.collection(owner_user_id, "pending_actions").document(token)
@@ -208,6 +212,7 @@ class FirestoreRegistry:
                     "proposal": proposal.model_dump(mode="json"),
                     "source_note_id": source_note_id,
                     "debug_mode": debug_mode,
+                    "error_report": error_report,
                     "status": "pending",
                     "created_at": now,
                     "expires_at": now + timedelta(hours=expiry_hours),
@@ -218,6 +223,170 @@ class FirestoreRegistry:
         status = create_if_absent(transaction)
         self.ensure_user(owner_user_id)
         return token, status
+
+    def migration_candidates(
+        self,
+        owner_user_id: int,
+        migration_id: str,
+    ) -> tuple[list[dict[str, Any]], int]:
+        definition = MIGRATIONS.get(migration_id)
+        if definition is None:
+            raise ValueError(f"Unknown migration: {migration_id}")
+
+        candidates: list[dict[str, Any]] = []
+        for note in self.all_notes(owner_user_id):
+            missing = missing_friend_note_sections(note)
+            if missing is None:
+                continue
+            candidates.append(
+                {
+                    "id": str(note["id"]),
+                    "expected_hash": hashlib.sha256(
+                        str(note.get("content", "")).encode()
+                    ).hexdigest(),
+                    "content": str(note.get("content", "")),
+                    "target_name": str(note.get("target_name", "Unknown")),
+                    "new_sections": missing,
+                }
+            )
+        batch = candidates[:MIGRATION_BATCH_SIZE]
+        return batch, max(0, len(candidates) - len(batch))
+
+    def stage_migration(
+        self,
+        owner_user_id: int,
+        migration_id: str,
+        changes: Sequence[dict[str, Any]],
+        remaining_count: int,
+        expiry_hours: int,
+    ) -> tuple[str, dict[str, Any]]:
+        definition = MIGRATIONS.get(migration_id)
+        if definition is None:
+            raise ValueError(f"Unknown migration: {migration_id}")
+        token = uuid.uuid4().hex
+        now = utc_now()
+        if changes:
+            self.collection(owner_user_id, "migration_actions").document(token).set(
+                {
+                    "migration_id": migration_id,
+                    "target_version": definition.target_version,
+                    "changes": list(changes),
+                    "remaining_count": remaining_count,
+                    "status": "pending",
+                    "created_at": now,
+                    "expires_at": now + timedelta(hours=expiry_hours),
+                }
+            )
+        self.ensure_user(owner_user_id)
+        return token, {
+            "migration_id": migration_id,
+            "description": definition.description,
+            "change_count": len(changes),
+            "remaining_count": remaining_count,
+        }
+
+    def get_migration_action(
+        self, owner_user_id: int, token: str
+    ) -> dict[str, Any] | None:
+        snapshot = self.collection(
+            owner_user_id, "migration_actions"
+        ).document(token).get()
+        if not snapshot.exists:
+            return None
+        data = snapshot.to_dict() or {}
+        data["id"] = snapshot.id
+        return data
+
+    def decide_migration(
+        self,
+        owner_user_id: int,
+        token: str,
+        apply: bool,
+    ) -> tuple[str, dict[str, int]]:
+        action_ref = self.collection(
+            owner_user_id, "migration_actions"
+        ).document(token)
+        transaction = self.client.transaction()
+
+        @firestore.transactional
+        def decide(txn: Any) -> tuple[str, dict[str, int]]:
+            action_snapshot = action_ref.get(transaction=txn)
+            if not action_snapshot.exists:
+                return "missing", {}
+            action = action_snapshot.to_dict() or {}
+            status = str(action.get("status", "missing"))
+            if status != "pending":
+                return status, {}
+            if action.get("expires_at") and action["expires_at"] <= utc_now():
+                txn.update(
+                    action_ref,
+                    {"status": "expired", "decided_at": firestore.SERVER_TIMESTAMP},
+                )
+                return "expired", {}
+            if not apply:
+                txn.update(
+                    action_ref,
+                    {"status": "cancelled", "decided_at": firestore.SERVER_TIMESTAMP},
+                )
+                return "cancelled", {}
+
+            note_snapshots = []
+            notes = self.collection(owner_user_id, "notes")
+            for change in action.get("changes", []):
+                note_snapshots.append(
+                    (change, notes.document(str(change["id"])).get(transaction=txn))
+                )
+
+            updated = 0
+            skipped = 0
+            backups = self.collection(owner_user_id, "migration_backups")
+            for change, snapshot in note_snapshots:
+                if not snapshot.exists:
+                    skipped += 1
+                    continue
+                note = snapshot.to_dict() or {}
+                current_hash = hashlib.sha256(
+                    str(note.get("content", "")).encode()
+                ).hexdigest()
+                if (
+                    current_hash != change.get("expected_hash")
+                    or migrate_friend_note(note) is None
+                ):
+                    skipped += 1
+                    continue
+                new_content = str(change["new_content"])
+                backup_ref = backups.document(f"{token}_{snapshot.id}")
+                txn.set(
+                    backup_ref,
+                    {
+                        "migration_id": action["migration_id"],
+                        "note_id": snapshot.id,
+                        "content": str(note.get("content", "")),
+                        "schema_version": note.get("schema_version"),
+                        "created_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+                txn.update(
+                    snapshot.reference,
+                    {
+                        "content": new_content,
+                        "schema_version": int(action["target_version"]),
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                )
+                updated += 1
+            txn.update(
+                action_ref,
+                {
+                    "status": "applied",
+                    "updated_count": updated,
+                    "skipped_count": skipped,
+                    "decided_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return "applied", {"updated": updated, "skipped": skipped}
+
+        return decide(transaction)
 
     def latest_pending_action(self, owner_user_id: int) -> dict[str, Any] | None:
         rows: list[dict[str, Any]] = []
@@ -253,6 +422,27 @@ class FirestoreRegistry:
         ref.update({"chat_id": chat_id, "message_id": message_id})
         return True
 
+    def set_pending_error_report(
+        self,
+        owner_user_id: int,
+        token: str,
+        error_report: dict[str, Any],
+    ) -> bool:
+        ref = self.collection(owner_user_id, "pending_actions").document(token)
+        snapshot = ref.get()
+        if not snapshot.exists:
+            return False
+        data = snapshot.to_dict() or {}
+        if str(data.get("status", "missing")) != "pending":
+            return False
+        ref.update(
+            {
+                "error_report": error_report,
+                "error_at": firestore.SERVER_TIMESTAMP,
+            }
+        )
+        return True
+
     def revise_pending(
         self,
         owner_user_id: int,
@@ -286,6 +476,73 @@ class FirestoreRegistry:
             return "pending"
 
         return revise(transaction)
+
+    def begin_pending_manual_edit(
+        self, owner_user_id: int, token: str, item_index: int
+    ) -> str:
+        ref = self.collection(owner_user_id, "pending_actions").document(token)
+        transaction = self.client.transaction()
+
+        @firestore.transactional
+        def begin(txn: Any) -> str:
+            snapshot = ref.get(transaction=txn)
+            if not snapshot.exists:
+                return "missing"
+            data = snapshot.to_dict() or {}
+            status = str(data.get("status", "missing"))
+            if status != "pending":
+                return status
+            if data.get("expires_at") and data["expires_at"] <= utc_now():
+                txn.update(ref, {"status": "expired", "decided_at": utc_now()})
+                return "expired"
+            proposal = NoteProposal.model_validate(data["proposal"])
+            if (
+                item_index < 0
+                or item_index >= len(proposal.items)
+                or proposal.items[item_index].category != "note"
+            ):
+                return "invalid"
+            txn.update(ref, {"manual_edit_item_index": item_index})
+            return "pending"
+
+        return begin(transaction)
+
+    def replace_pending_item(
+        self,
+        owner_user_id: int,
+        token: str,
+        proposal: NoteProposal,
+        item_index: int,
+    ) -> str:
+        ref = self.collection(owner_user_id, "pending_actions").document(token)
+        transaction = self.client.transaction()
+
+        @firestore.transactional
+        def replace(txn: Any) -> str:
+            snapshot = ref.get(transaction=txn)
+            if not snapshot.exists:
+                return "missing"
+            data = snapshot.to_dict() or {}
+            status = str(data.get("status", "missing"))
+            if status != "pending":
+                return status
+            if data.get("manual_edit_item_index") != item_index:
+                return "invalid"
+            if data.get("expires_at") and data["expires_at"] <= utc_now():
+                txn.update(ref, {"status": "expired", "decided_at": utc_now()})
+                return "expired"
+            txn.update(
+                ref,
+                {
+                    "proposal": proposal.model_dump(mode="json"),
+                    "manual_edit_item_index": firestore.DELETE_FIELD,
+                    "last_instruction": "Manual full-note replacement",
+                    "revised_at": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return "pending"
+
+        return replace(transaction)
 
     def cancel_pending(self, owner_user_id: int, token: str) -> str:
         ref = self.collection(owner_user_id, "pending_actions").document(token)
@@ -444,6 +701,8 @@ class FirestoreRegistry:
                     "archived_at": None,
                     "updated_at": firestore.SERVER_TIMESTAMP,
                 }
+                if item.target_type == "friend" and item.category == "note":
+                    note_data["schema_version"] = FRIEND_NOTE_SCHEMA_VERSION
                 if not active_notes:
                     note_data["created_at"] = firestore.SERVER_TIMESTAMP
                 txn.set(note_ref, note_data, merge=bool(active_notes))
@@ -572,16 +831,6 @@ class FirestoreRegistry:
             if isinstance(note.get("follow_up_at"), datetime)
             and note["follow_up_at"] <= now
         ]
-
-    def project_next_actions(
-        self, owner_user_id: int, limit: int = 30
-    ) -> list[dict[str, Any]]:
-        return [
-            note
-            for note in self.pending_followups(owner_user_id, limit=1000)
-            if note.get("target_type") == "project"
-            and note.get("category") in {"follow_up", "next_action"}
-        ][:limit]
 
     def complete_followup(self, owner_user_id: int, note_id: str) -> bool:
         ref = self.collection(owner_user_id, "notes").document(note_id)
